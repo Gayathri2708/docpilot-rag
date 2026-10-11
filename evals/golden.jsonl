@@ -1,0 +1,20 @@
+{"id": "leave-days", "question": "How many days of paid leave do employees get each year?", "answerable": true, "evidence": "24 days of paid leave per calendar year", "answer_keywords": ["24"]}
+{"id": "leave-carry", "question": "How much unused paid leave can be carried into the next year?", "answerable": true, "evidence": "up to a maximum of 10 days", "answer_keywords": ["10"]}
+{"id": "office-days", "question": "Which days do employees have to be in the office?", "answerable": true, "evidence": "Tuesday, Wednesday and Thursday", "answer_keywords": ["tuesday", "wednesday", "thursday"]}
+{"id": "core-hours", "question": "What are the core collaboration hours?", "answerable": true, "evidence": "11:00 to 16:00 IST", "answer_keywords": [["11:00", "11 am", "11am", "11 a.m."], ["16:00", "4 pm", "4pm", "4 p.m."]]}
+{"id": "parental-primary", "question": "How long is parental leave for the primary caregiver?", "answerable": true, "evidence": "26 weeks of fully paid leave for the primary caregiver", "answer_keywords": ["26"]}
+{"id": "learning-budget", "question": "What is the annual learning budget per employee?", "answerable": true, "evidence": "annual learning budget of ₹60,000", "answer_keywords": [["60,000", "60000", "60k"]]}
+{"id": "laptop", "question": "Which laptops can new employees choose from?", "answerable": true, "evidence": "MacBook Pro 14 or a ThinkPad X1 Carbon", "answer_keywords": ["macbook", "thinkpad"]}
+{"id": "home-office", "question": "How much is the home office stipend?", "answerable": true, "evidence": "home office stipend of ₹25,000", "answer_keywords": [["25,000", "25000", "25k"]]}
+{"id": "expense-deadline", "question": "What is the deadline to submit a business expense?", "answerable": true, "evidence": "within 30 days of the purchase date", "answer_keywords": ["30"]}
+{"id": "receipts", "question": "Above what amount are receipts required for expenses?", "answerable": true, "evidence": "Receipts are mandatory for every expense above ₹500", "answer_keywords": ["500"]}
+{"id": "oncall-allowance", "question": "How much is the on-call allowance?", "answerable": true, "evidence": "on-call allowance of ₹4,000 per week", "answer_keywords": [["4,000", "4000", "4k"]]}
+{"id": "p1-ack", "question": "How quickly must a P1 incident be acknowledged?", "answerable": true, "evidence": "acknowledged within 15 minutes", "answer_keywords": ["15"]}
+{"id": "reviews", "question": "When do performance reviews happen?", "answerable": true, "evidence": "twice a year, in April and October", "answer_keywords": ["april", "october"]}
+{"id": "notice", "question": "What is the notice period after probation is confirmed?", "answerable": true, "evidence": "the notice period is 60 days", "answer_keywords": ["60"]}
+{"id": "referral", "question": "How much is the referral bonus for an engineering hire?", "answerable": true, "evidence": "₹75,000 for engineering hires", "answer_keywords": [["75,000", "75000", "75k"]]}
+{"id": "payments-pr", "question": "How many approvals does a pull request to the payments service need?", "answerable": true, "evidence": "Changes to the payments service need two approvals", "answer_keywords": [["two", "2"]]}
+{"id": "unans-esop", "question": "What is the vesting schedule for employee stock options?", "answerable": false, "evidence": null, "answer_keywords": []}
+{"id": "unans-lunch", "question": "Does the company provide free lunch in the office?", "answerable": false, "evidence": null, "answer_keywords": []}
+{"id": "unans-dress", "question": "What is the dress code at Northwind Labs?", "answerable": false, "evidence": null, "answer_keywords": []}
+{"id": "unans-ceo", "question": "Who is the CEO of Northwind Labs?", "answerable": false, "evidence": null, "answer_keywords": []}
