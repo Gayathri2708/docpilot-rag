@@ -67,13 +67,13 @@ def stub_backends(monkeypatch):
 
 
 def test_vector_mode_skips_keyword_search(stub_backends):
-    hits = retrieval.search("q", k=2, mode="vector", rerank=False)
+    hits = retrieval.search("q", groups=["all"], k=2, mode="vector", rerank=False)
     assert [h.chunk_id for h in hits] == [1, 2]
     assert stub_backends == [("vector", 2)]  # no wider pool needed
 
 
 def test_hybrid_mode_fuses_both_retrievers(stub_backends):
-    hits = retrieval.search("q", k=4, mode="hybrid", rerank=False)
+    hits = retrieval.search("q", groups=["all"], k=4, mode="hybrid", rerank=False)
     # 3 is in both lists, so it rises to the top; 4 comes only from keyword search.
     assert [h.chunk_id for h in hits] == [3, 1, 2, 4]
     assert {kind for kind, _ in stub_backends} == {"vector", "keyword"}
@@ -81,7 +81,7 @@ def test_hybrid_mode_fuses_both_retrievers(stub_backends):
 
 
 def test_hits_keep_cosine_score_after_fusion(stub_backends):
-    hits = retrieval.search("q", k=4, mode="hybrid", rerank=False)
+    hits = retrieval.search("q", groups=["all"], k=4, mode="hybrid", rerank=False)
     assert {h.chunk_id: h.score for h in hits} == {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6}
 
 
@@ -90,12 +90,27 @@ def test_rerank_reorders_candidates(stub_backends, monkeypatch):
     monkeypatch.setattr(
         retrieval, "rerank_scores", lambda q, passages: [float(p.split()[-1]) for p in passages]
     )
-    hits = retrieval.search("q", k=2, mode="hybrid", rerank=True)
+    hits = retrieval.search("q", groups=["all"], k=2, mode="hybrid", rerank=True)
     assert [h.chunk_id for h in hits] == [4, 3]
 
 
 def test_settings_supply_defaults(stub_backends, monkeypatch):
     monkeypatch.setattr(retrieval.settings, "retrieval_mode", "hybrid")
     monkeypatch.setattr(retrieval.settings, "rerank", False)
-    retrieval.search("q", k=2)
+    retrieval.search("q", groups=["all"], k=2)
     assert ("keyword", 20) in stub_backends
+
+
+# ---------- access control ----------
+
+def test_both_retrievers_filter_by_access_group_in_sql():
+    for sql in (retrieval._VECTOR_SQL, retrieval._KEYWORD_SQL):
+        assert "d.access_group = ANY(%(groups)s)" in sql
+
+
+def test_search_passes_caller_groups_to_every_query(monkeypatch):
+    seen = []
+    monkeypatch.setattr(retrieval, "_fetch", lambda sql, params: seen.append(params["groups"]) or [])
+    monkeypatch.setattr(retrieval, "embed_query", lambda q: [0.0])
+    retrieval.search("q", k=5, groups=("all", "engineering"), mode="hybrid", rerank=False)
+    assert seen == [["all", "engineering"], ["all", "engineering"]]

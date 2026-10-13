@@ -1,0 +1,9 @@
+{
+  "top_k": 5,
+  "measured": "2026-10-13, retrieval-only, 60 cases, evals/sample_docs",
+  "modes": {
+    "vector": {"retrieval_hit_at_k": 1.0, "retrieval_mrr": 0.886},
+    "hybrid": {"retrieval_hit_at_k": 1.0, "retrieval_mrr": 0.911},
+    "hybrid+rerank": {"retrieval_hit_at_k": 0.979, "retrieval_mrr": 0.958}
+  }
+}

@@ -1,9 +1,13 @@
 """Retrieval: vector search, optional keyword search fused with Reciprocal Rank Fusion, optional reranking.
 
+Both retrievers filter by the caller's access groups inside SQL, so chunks the caller may not read
+are never ranked, reranked or sent to the LLM.
+
 Every Hit keeps its cosine similarity as `score`, whatever the mode. Fusion and reranking only
 change the order, so the relevance gate (llm.is_answerable) means the same thing in every mode.
 """
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -23,18 +27,20 @@ class Hit:
     chunk_index: int
     content: str
     score: float  # cosine similarity, higher is better
+    access_group: str = "all"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 _COLUMNS = """c.id, c.document_id, d.filename, c.page, c.chunk_index, c.content,
-       1 - (c.embedding <=> %(q)s) AS score"""
+       1 - (c.embedding <=> %(q)s) AS score, d.access_group"""
 
 _VECTOR_SQL = f"""
 SELECT {_COLUMNS}
 FROM chunks c
 JOIN documents d ON d.id = c.document_id
+WHERE d.access_group = ANY(%(groups)s)
 ORDER BY c.embedding <=> %(q)s
 LIMIT %(n)s
 """
@@ -49,7 +55,7 @@ SELECT {_COLUMNS}
 FROM chunks c
 JOIN documents d ON d.id = c.document_id
 CROSS JOIN q
-WHERE c.tsv @@ q.query
+WHERE c.tsv @@ q.query AND d.access_group = ANY(%(groups)s)
 ORDER BY ts_rank_cd(c.tsv, q.query) DESC, c.id
 LIMIT %(n)s
 """
@@ -80,21 +86,26 @@ def _fetch(sql: str, params: dict) -> list[Hit]:
             chunk_index=row[4],
             content=row[5],
             score=round(float(row[6]), 4),
+            access_group=row[7],
         )
         for row in rows
     ]
 
 
-def search(query: str, k: int, mode: Mode | None = None, rerank: bool | None = None) -> list[Hit]:
+def search(
+    query: str, k: int, groups: Sequence[str], mode: Mode | None = None, rerank: bool | None = None
+) -> list[Hit]:
+    """Top-k chunks from documents in `groups` (the caller's access groups)."""
     mode = mode or settings.retrieval_mode
     rerank = settings.rerank if rerank is None else rerank
     query_vector = embed_query(query)
     # Fusion and reranking need a wider candidate pool than the k chunks finally returned.
     pool = max(k, settings.candidate_pool) if mode == "hybrid" or rerank else k
 
-    candidates = _fetch(_VECTOR_SQL, {"q": query_vector, "n": pool})
+    params = {"q": query_vector, "groups": list(groups), "n": pool}
+    candidates = _fetch(_VECTOR_SQL, params)
     if mode == "hybrid":
-        keyword = _fetch(_KEYWORD_SQL, {"q": query_vector, "text": query, "n": pool})
+        keyword = _fetch(_KEYWORD_SQL, {**params, "text": query})
         by_id = {h.chunk_id: h for h in candidates + keyword}
         fused = rrf_fuse([[h.chunk_id for h in candidates], [h.chunk_id for h in keyword]], settings.rrf_k)
         candidates = [by_id[i] for i in fused[:pool]]

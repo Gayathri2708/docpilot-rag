@@ -7,6 +7,8 @@ Runs every question in a golden set against a running DocPilot API and reports:
   - False refusals               : answerable questions the system wrongly refused
   - Citation rate                : answered questions that cite at least one source
   - Latency p50 / p95, for retrieval alone and for the full /ask call
+  - Injection resistance         : cases with `forbidden` strings (planted by prompt-injection text in a
+                                   document) whose answer contains none of them
 
 Usage (API running on localhost:8000):
     python evals/run_eval.py --upload evals/sample_docs/northwind_handbook.md
@@ -14,6 +16,8 @@ Usage (API running on localhost:8000):
     python evals/run_eval.py --delay 13   # stay under a 5 requests/minute free-tier LLM quota
     python evals/run_eval.py --mode hybrid+rerank
     python evals/run_eval.py --mode hybrid --retrieval-only   # no LLM calls
+    python evals/run_eval.py --retrieval-only --baseline evals/baseline.json   # CI regression gate
+    python evals/run_eval.py --golden evals/injection.jsonl --upload evals/injection_docs/*.md --cleanup
 
 Results are written to evals/results/<timestamp>.json so runs can be compared.
 """
@@ -22,7 +26,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -47,6 +53,11 @@ def keywords_match(answer: str, keywords: list[Keyword]) -> bool:
         if not any(normalize(opt) in text for opt in options):
             return False
     return True
+
+
+def contains_any(answer: str, phrases: list[str]) -> bool:
+    text = normalize(answer)
+    return any(normalize(p) in text for p in phrases)
 
 
 def is_refusal(answer: str) -> bool:
@@ -83,6 +94,7 @@ class CaseResult:
     cited: bool
     latency_ms: int
     retrieval_ms: int
+    obeyed_injection: bool | None = None  # None when the case has no `forbidden` strings
 
 
 @dataclass
@@ -115,6 +127,9 @@ class Report:
         }
         if self.retrieval_only:
             return retrieval
+        injection = [c for c in self.cases if c.obeyed_injection is not None]
+        if injection:
+            retrieval["injection_resistance"] = ratio(sum(not c.obeyed_injection for c in injection), len(injection))
         return {
             **retrieval,
             "answer_accuracy": ratio(sum(c.correct for c in ans), len(ans)),
@@ -161,6 +176,7 @@ def ask_with_retry(
 
 def run(
     base_url: str,
+    headers: dict,
     golden: list[dict],
     top_k: int,
     label: str,
@@ -170,7 +186,7 @@ def run(
 ) -> Report:
     options = MODES[mode]
     report = Report(label=label, top_k=top_k, mode=mode, retrieval_only=retrieval_only)
-    with httpx.Client(base_url=base_url, timeout=120) as client:
+    with httpx.Client(base_url=base_url, headers=headers, timeout=120) as client:
         for i, case in enumerate(golden):
             if i and delay and not retrieval_only:
                 time.sleep(delay)
@@ -197,6 +213,8 @@ def run(
                 correct = not refused and keywords_match(resp["answer"], case["answer_keywords"])
             else:
                 correct = refused
+            obeyed = contains_any(resp["answer"], case["forbidden"]) if case.get("forbidden") else None
+            correct = correct and not obeyed
             report.cases.append(CaseResult(
                 id=case["id"],
                 question=case["question"],
@@ -208,19 +226,49 @@ def run(
                 cited=any(s["cited"] for s in resp["sources"]),
                 latency_ms=latency,
                 retrieval_ms=retrieval_ms,
+                obeyed_injection=obeyed,
             ))
             status = "PASS" if correct else "FAIL"
             print(f"  {status}  {case['id']:<20} rank={rank}  {latency} ms", flush=True)
     return report
 
 
-def upload(base_url: str, paths: list[Path]) -> None:
-    with httpx.Client(base_url=base_url, timeout=300) as client:
+def upload(base_url: str, headers: dict, paths: list[Path]) -> list[str]:
+    """Index documents; returns the ids of the ones newly created by this call."""
+    created = []
+    with httpx.Client(base_url=base_url, headers=headers, timeout=300) as client:
         for path in paths:
             with path.open("rb") as fh:
                 data = client.post("/documents", files={"file": (path.name, fh)}).raise_for_status().json()
             note = ", already indexed" if data["duplicate"] else ""
             print(f"Uploaded {data['filename']} ({data['num_chunks']} chunks{note})")
+            if not data["duplicate"]:
+                created.append(data["id"])
+    return created
+
+
+def delete(base_url: str, headers: dict, ids: list[str]) -> None:
+    with httpx.Client(base_url=base_url, headers=headers, timeout=60) as client:
+        for doc_id in ids:
+            client.delete(f"/documents/{doc_id}").raise_for_status()
+    print(f"Removed {len(ids)} uploaded document(s)")
+
+
+GATED_METRICS = ("retrieval_hit_at_k", "retrieval_mrr")
+
+
+def check_baseline(summary: dict, baseline: dict, mode: str, top_k: int) -> list[str]:
+    """Regressions against the stored baseline for this mode; an empty list means the gate passes."""
+    if baseline["top_k"] != top_k:
+        return [f"baseline was measured at top_k={baseline['top_k']}, this run used top_k={top_k}"]
+    if mode not in baseline["modes"]:
+        return [f"no baseline recorded for mode {mode!r}"]
+    expected = baseline["modes"][mode]
+    return [
+        f"{metric} {summary[metric]} < baseline {expected[metric]}"
+        for metric in GATED_METRICS
+        if summary[metric] < expected[metric]
+    ]
 
 
 def main() -> None:
@@ -233,16 +281,26 @@ def main() -> None:
     parser.add_argument("--mode", choices=MODES, default="vector", help="retrieval mode to evaluate")
     parser.add_argument("--retrieval-only", action="store_true", help="measure retrieval only; no LLM calls")
     parser.add_argument("--label", help="name for this run, e.g. 'k=3'; defaults to the mode")
+    parser.add_argument("--api-key", default=os.getenv("DOCPILOT_API_KEY", "dp_demo_admin"),
+                        help="key with access to every group in the golden set (default: the demo admin key)")
+    parser.add_argument("--cleanup", action="store_true", help="delete the documents this run uploaded")
+    parser.add_argument("--strict", action="store_true", help="exit 1 if any case fails")
+    parser.add_argument("--baseline", type=Path,
+                        help="fail (exit 1) if hit@k or MRR falls below this baseline file for the mode")
     parser.add_argument("--out-dir", type=Path, default=HERE / "results")
     args = parser.parse_args()
 
-    if args.upload:
-        upload(args.base_url, args.upload)
+    headers = {"X-API-Key": args.api_key}
+    uploaded = upload(args.base_url, headers, args.upload) if args.upload else []
 
     label = args.label or args.mode
     golden = load_golden(args.golden)
     print(f"Running {len(golden)} cases (top_k={args.top_k}, mode={args.mode}, label={label})")
-    report = run(args.base_url, golden, args.top_k, label, args.delay, args.mode, args.retrieval_only)
+    try:
+        report = run(args.base_url, headers, golden, args.top_k, label, args.delay, args.mode, args.retrieval_only)
+    finally:
+        if args.cleanup and uploaded:
+            delete(args.base_url, headers, uploaded)
     summary = report.summary()
 
     print("\nResults")
@@ -262,6 +320,20 @@ def main() -> None:
         indent=2, ensure_ascii=False,
     ))
     print(f"\nSaved {out}")
+
+    if args.baseline:
+        failures = check_baseline(summary, json.loads(args.baseline.read_text()), args.mode, args.top_k)
+        for failure in failures:
+            print(f"REGRESSION ({args.mode}): {failure}")
+        if failures:
+            sys.exit(1)
+        print(f"Baseline check passed for {args.mode}.")
+
+    if args.strict and not args.retrieval_only:
+        failed = [c.id for c in report.cases if not c.correct]
+        if failed:
+            print(f"FAILED cases: {', '.join(failed)}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

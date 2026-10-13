@@ -10,13 +10,21 @@ from .config import settings
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
-pool = ConnectionPool(
-    settings.database_url,
-    min_size=1,
-    max_size=10,
-    configure=register_vector,
-    open=False,
-)
+
+def _configure(conn: psycopg.Connection) -> None:
+    register_vector(conn)
+    # Retrieval filters by access group. Plain HNSW search filters *after* the index scan, so a
+    # restrictive filter can return fewer than k rows; iterative scans keep going until enough
+    # rows pass the filter, in exact distance order. Requires pgvector >= 0.8.
+    conn.execute("SET hnsw.iterative_scan = strict_order")
+    conn.commit()
+
+
+def make_pool(database_url: str) -> ConnectionPool:
+    return ConnectionPool(database_url, min_size=1, max_size=10, configure=_configure, open=False)
+
+
+pool = make_pool(settings.database_url)
 
 
 def apply_schema() -> None:

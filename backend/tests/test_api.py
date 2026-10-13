@@ -1,5 +1,6 @@
-"""API tests with retrieval and the LLM stubbed out, so they run without Postgres or an API key.
-(TestClient is used without a `with` block, so the startup hook that connects to the DB does not run.)"""
+"""API tests with retrieval, the LLM and API-key lookup stubbed out, so they run without Postgres or an LLM key.
+(TestClient is used without a `with` block, so the startup hook that connects to the DB does not run.)
+End-to-end access-control tests against a real database are in test_rbac_integration.py."""
 
 import json
 
@@ -8,10 +9,25 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
-from app import llm, main
+from app import auth, llm, main
+from app.auth import Principal, require_principal
 from app.retrieval import Hit
 
 client = TestClient(main.app)
+
+ADMIN = Principal("test-admin", ("all", "hr", "finance", "engineering"))
+ENGINEER = Principal("test-engineering", ("all", "engineering"))
+
+
+@pytest.fixture(autouse=True)
+def caller():
+    """Every request is made as ADMIN unless a test switches the caller."""
+    def use(principal):
+        main.app.dependency_overrides[require_principal] = lambda: principal
+
+    use(ADMIN)
+    yield use
+    main.app.dependency_overrides.clear()
 
 HITS = [
     Hit(1, "d1", "handbook.md", None, 0, "Employees receive 24 days of paid leave per calendar year.", 0.82),
@@ -21,13 +37,13 @@ HITS = [
 
 @pytest.fixture
 def relevant(monkeypatch):
-    monkeypatch.setattr(main, "search", lambda q, k, mode=None, rerank=None: HITS[:k])
+    monkeypatch.setattr(main, "search", lambda q, k, groups, mode=None, rerank=None: HITS[:k])
 
 
 @pytest.fixture
 def irrelevant(monkeypatch):
     unrelated = Hit(3, "d1", "handbook.md", None, 2, "Unrelated.", 0.2)
-    monkeypatch.setattr(main, "search", lambda q, k, mode=None, rerank=None: [unrelated])
+    monkeypatch.setattr(main, "search", lambda q, k, groups, mode=None, rerank=None: [unrelated])
 
 
 def test_ask_returns_answer_with_cited_sources(relevant, monkeypatch):
@@ -121,3 +137,82 @@ def test_unsupported_upload_is_rejected(monkeypatch):
     monkeypatch.setattr(main.db, "get_conn", lambda: NoDuplicate())
     res = client.post("/documents", files={"file": ("photo.png", b"\x89PNG data")})
     assert res.status_code == 415
+
+
+# ---------- authentication and access control ----------
+
+@pytest.fixture
+def real_auth(monkeypatch):
+    """Use the real require_principal, with the key lookup stubbed instead of the database."""
+    main.app.dependency_overrides.clear()
+    keys = {"good-key": ENGINEER}
+    monkeypatch.setattr(auth, "lookup", lambda key: keys.get(key))
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/search", {"query": "leave"}),
+    ("/ask", {"question": "leave"}),
+    ("/ask/stream", {"question": "leave"}),
+])
+def test_missing_or_invalid_key_returns_401(real_auth, path, body):
+    assert client.post(path, json=body).status_code == 401
+    assert client.post(path, json=body, headers={"X-API-Key": "wrong"}).status_code == 401
+
+
+def test_documents_endpoints_require_key(real_auth):
+    assert client.get("/documents").status_code == 401
+    assert client.delete("/documents/abc").status_code == 401
+    assert client.post("/documents", files={"file": ("a.md", b"text")}).status_code == 401
+
+
+def test_health_is_public(real_auth, monkeypatch):
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *args):
+            return self
+
+    monkeypatch.setattr(main.db, "get_conn", lambda: Conn())
+    assert client.get("/health").status_code == 200
+
+
+def test_valid_key_reaches_search_with_its_groups(real_auth, monkeypatch):
+    seen = {}
+
+    def fake_search(q, k, groups, mode=None, rerank=None):
+        seen["groups"] = groups
+        return []
+
+    monkeypatch.setattr(main, "search", fake_search)
+    resp = client.post("/search", json={"query": "leave"}, headers={"X-API-Key": "good-key"})
+    assert resp.status_code == 200
+    assert seen["groups"] == ("all", "engineering")
+
+
+@pytest.mark.parametrize("path, body", [("/ask", {"question": "q"}), ("/ask/stream", {"question": "q"})])
+def test_ask_endpoints_retrieve_with_caller_groups(caller, monkeypatch, path, body):
+    seen = {}
+
+    def fake_search(q, k, groups, mode=None, rerank=None):
+        seen["groups"] = groups
+        return []
+
+    caller(ENGINEER)
+    monkeypatch.setattr(main, "search", fake_search)
+    client.post(path, json=body)
+    assert seen["groups"] == ("all", "engineering")
+
+
+def test_upload_into_a_group_the_key_lacks_is_forbidden(caller):
+    caller(ENGINEER)
+    resp = client.post("/documents", files={"file": ("pay.md", b"salary bands")}, data={"access_group": "hr"})
+    assert resp.status_code == 403
+
+
+def test_upload_rejects_unknown_group():
+    resp = client.post("/documents", files={"file": ("a.md", b"text")}, data={"access_group": "legal"})
+    assert resp.status_code == 422

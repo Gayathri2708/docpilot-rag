@@ -28,13 +28,16 @@ class Settings(BaseSettings):
     min_relevance: float = 0.55
 
     # "vector" = embeddings only; "hybrid" = embeddings + Postgres full-text search, fused with RRF.
-    retrieval_mode: Literal["vector", "hybrid"] = "vector"
+    retrieval_mode: Literal["vector", "hybrid"] = "hybrid"  # measured better: evals/baseline.json
     # Re-order the candidates with a local cross-encoder before taking the top k.
     rerank: bool = False
     rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     candidate_pool: int = 20  # candidates per retriever for fusion, and for the reranker
     rrf_k: int = 60  # standard RRF constant; larger flattens the difference between ranks
     max_upload_mb: int = 20
+
+    # Seed the well-known demo API keys (app/auth.py) on startup. Set to false anywhere real.
+    seed_demo_keys: bool = True
 
 
 settings = Settings()

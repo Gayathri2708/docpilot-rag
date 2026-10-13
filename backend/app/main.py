@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import openai
-from fastapi import FastAPI, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Response, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, llm
+from .auth import ACCESS_GROUPS, Principal, require_principal, seed_demo_keys
 from .config import settings
 from .embeddings import embed_passages
 from .ingest import UnsupportedFileType, chunk_pages, extract_pages, sha256
@@ -25,6 +26,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 async def lifespan(_: FastAPI):
     db.apply_schema()
     db.open_pool()
+    if settings.seed_demo_keys:
+        seed_demo_keys()
     yield
     db.close_pool()
 
@@ -39,6 +42,7 @@ class DocumentOut(BaseModel):
     id: str
     filename: str
     num_chunks: int
+    access_group: str = "all"
     duplicate: bool = False
 
 
@@ -62,6 +66,7 @@ class Source(BaseModel):
     page: int | None
     score: float
     content: str
+    access_group: str
     cited: bool
 
 
@@ -74,7 +79,15 @@ class AskResponse(BaseModel):
 
 def _sources(hits: list[Hit], cited: list[int]) -> list[Source]:
     return [
-        Source(number=i, filename=h.filename, page=h.page, score=h.score, content=h.content, cited=i in cited)
+        Source(
+            number=i,
+            filename=h.filename,
+            page=h.page,
+            score=h.score,
+            content=h.content,
+            access_group=h.access_group,
+            cited=i in cited,
+        )
         for i, h in enumerate(hits, start=1)
     ]
 
@@ -97,8 +110,20 @@ def health() -> dict:
     return {"status": "ok", "llm_configured": bool(settings.llm_api_key)}
 
 
+Caller = Depends(require_principal)
+
+
 @app.post("/documents", response_model=DocumentOut, status_code=201)
-def upload_document(file: UploadFile, response: Response) -> DocumentOut:
+def upload_document(
+    file: UploadFile,
+    response: Response,
+    access_group: str = Form("all", description=f"one of {', '.join(ACCESS_GROUPS)}"),
+    principal: Principal = Caller,
+) -> DocumentOut:
+    if access_group not in ACCESS_GROUPS:
+        raise HTTPException(422, f"access_group must be one of {', '.join(ACCESS_GROUPS)}.")
+    if not principal.can_access(access_group):
+        raise HTTPException(403, f"This API key cannot write to the {access_group!r} group.")
     filename = file.filename or "upload"
     data = file.file.read(settings.max_upload_mb * 1024 * 1024 + 1)
     if len(data) > settings.max_upload_mb * 1024 * 1024:
@@ -109,11 +134,15 @@ def upload_document(file: UploadFile, response: Response) -> DocumentOut:
     digest = sha256(data)
     with db.get_conn() as conn:
         existing = conn.execute(
-            "SELECT id, filename, num_chunks FROM documents WHERE sha256 = %s", (digest,)
+            "SELECT id, filename, num_chunks, access_group FROM documents WHERE sha256 = %s", (digest,)
         ).fetchone()
     if existing:
+        if not principal.can_access(existing[3]):  # don't reveal a document the caller can't read
+            raise HTTPException(409, "This file is already indexed in an access group this key cannot read.")
         response.status_code = 200
-        return DocumentOut(id=str(existing[0]), filename=existing[1], num_chunks=existing[2], duplicate=True)
+        return DocumentOut(
+            id=str(existing[0]), filename=existing[1], num_chunks=existing[2], access_group=existing[3], duplicate=True
+        )
 
     start = time.perf_counter()
     try:
@@ -130,8 +159,8 @@ def upload_document(file: UploadFile, response: Response) -> DocumentOut:
 
     with db.get_conn() as conn, conn.transaction():
         doc_id = conn.execute(
-            "INSERT INTO documents (filename, sha256, num_chunks) VALUES (%s, %s, %s) RETURNING id",
-            (filename, digest, len(chunks)),
+            "INSERT INTO documents (filename, sha256, num_chunks, access_group) VALUES (%s, %s, %s, %s) RETURNING id",
+            (filename, digest, len(chunks), access_group),
         ).fetchone()[0]
         with conn.cursor() as cur:
             cur.executemany(
@@ -139,36 +168,46 @@ def upload_document(file: UploadFile, response: Response) -> DocumentOut:
                 [(doc_id, c.index, c.page, c.content, v) for c, v in zip(chunks, vectors, strict=True)],
             )
 
-    log.info("ingested %s: %d pages, %d chunks in %d ms", filename, len(pages), len(chunks), _ms(start))
-    return DocumentOut(id=str(doc_id), filename=filename, num_chunks=len(chunks))
+    log.info(
+        "ingested %s into %s: %d pages, %d chunks in %d ms", filename, access_group, len(pages), len(chunks), _ms(start)
+    )
+    return DocumentOut(id=str(doc_id), filename=filename, num_chunks=len(chunks), access_group=access_group)
 
 
 @app.get("/documents", response_model=list[DocumentOut])
-def list_documents() -> list[DocumentOut]:
+def list_documents(principal: Principal = Caller) -> list[DocumentOut]:
     with db.get_conn() as conn:
-        rows = conn.execute("SELECT id, filename, num_chunks FROM documents ORDER BY created_at DESC").fetchall()
-    return [DocumentOut(id=str(r[0]), filename=r[1], num_chunks=r[2]) for r in rows]
+        rows = conn.execute(
+            "SELECT id, filename, num_chunks, access_group FROM documents"
+            " WHERE access_group = ANY(%s) ORDER BY created_at DESC",
+            (list(principal.groups),),
+        ).fetchall()
+    return [DocumentOut(id=str(r[0]), filename=r[1], num_chunks=r[2], access_group=r[3]) for r in rows]
 
 
 @app.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: str) -> Response:
+def delete_document(document_id: str, principal: Principal = Caller) -> Response:
     with db.get_conn() as conn:
-        deleted = conn.execute("DELETE FROM documents WHERE id::text = %s RETURNING id", (document_id,)).fetchone()
+        # Documents outside the caller's groups are reported as not found, not as forbidden.
+        deleted = conn.execute(
+            "DELETE FROM documents WHERE id::text = %s AND access_group = ANY(%s) RETURNING id",
+            (document_id, list(principal.groups)),
+        ).fetchone()
     if not deleted:
         raise HTTPException(404, "Document not found.")
     return Response(status_code=204)
 
 
 @app.post("/search")
-def search_chunks(req: SearchRequest) -> list[dict]:
+def search_chunks(req: SearchRequest, principal: Principal = Caller) -> list[dict]:
     """Retrieval only, no LLM. Used by the eval harness to measure retrieval quality."""
-    return [h.to_dict() for h in search(req.query, req.top_k, req.mode, req.rerank)]
+    return [h.to_dict() for h in search(req.query, req.top_k, principal.groups, req.mode, req.rerank)]
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest) -> AskResponse:
+def ask(req: AskRequest, principal: Principal = Caller) -> AskResponse:
     t0 = time.perf_counter()
-    hits = search(req.question, req.top_k, req.mode, req.rerank)
+    hits = search(req.question, req.top_k, principal.groups, req.mode, req.rerank)
     timings = {"retrieval": _ms(t0)}
 
     if not llm.is_answerable(hits, settings.min_relevance):
@@ -196,12 +235,12 @@ def _sse(event: str, payload: dict) -> str:
 
 
 @app.post("/ask/stream")
-def ask_stream(req: AskRequest) -> StreamingResponse:
+def ask_stream(req: AskRequest, principal: Principal = Caller) -> StreamingResponse:
     """Server-Sent Events: `sources` first, then `token` events, then `done` (or `error`)."""
 
     def events() -> Iterator[str]:
         t0 = time.perf_counter()
-        hits = search(req.question, req.top_k, req.mode, req.rerank)
+        hits = search(req.question, req.top_k, principal.groups, req.mode, req.rerank)
         yield _sse("sources", {"sources": [s.model_dump() for s in _sources(hits, [])]})
 
         if not llm.is_answerable(hits, settings.min_relevance):
