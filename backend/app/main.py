@@ -6,16 +6,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import openai
+import psycopg
 from fastapi import Depends, FastAPI, Form, HTTPException, Response, UploadFile
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, llm
-from .auth import ACCESS_GROUPS, Principal, require_principal, seed_demo_keys
+from .auth import ACCESS_GROUPS, Principal, require_principal, revoke_demo_keys, seed_demo_keys
 from .config import settings
 from .embeddings import embed_passages
-from .ingest import UnsupportedFileType, chunk_pages, extract_pages, sha256
+from .ingest import UnreadableFile, UnsupportedFileType, chunk_pages, extract_pages, sha256
 from .retrieval import Hit, Mode, search
 
 log = logging.getLogger("docpilot")
@@ -28,6 +29,9 @@ async def lifespan(_: FastAPI):
     db.open_pool()
     if settings.seed_demo_keys:
         seed_demo_keys()
+        log.warning("Demo API keys are enabled (dp_demo_*). Set SEED_DEMO_KEYS=false for any real deployment.")
+    elif revoked := revoke_demo_keys():
+        log.info("SEED_DEMO_KEYS=false: revoked %d demo API key(s)", revoked)
     yield
     db.close_pool()
 
@@ -104,10 +108,24 @@ def root() -> RedirectResponse:
 
 
 @app.get("/health")
-def health() -> dict:
-    with db.get_conn() as conn:
-        conn.execute("SELECT 1")
-    return {"status": "ok", "llm_configured": bool(settings.llm_api_key)}
+def health():
+    try:
+        with db.get_conn() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        log.exception("health check: database unavailable")
+        return JSONResponse({"status": "unavailable", "database": False}, status_code=503)
+    return {"status": "ok", "database": True, "llm_configured": bool(settings.llm_api_key)}
+
+
+def _provider_error(exc: Exception) -> str:
+    """Client-facing message for a generation failure. Provider errors can carry account details
+    (organisation ids, quotas), so the full text goes to the server log only."""
+    if isinstance(exc, llm.LLMNotConfigured):
+        return str(exc)
+    if isinstance(exc, openai.RateLimitError):
+        return "LLM provider error: rate limit reached. Try again later."
+    return f"LLM provider error ({type(exc).__name__}). See the server log for details."
 
 
 Caller = Depends(require_principal)
@@ -149,6 +167,8 @@ def upload_document(
         pages = extract_pages(filename, data)
     except UnsupportedFileType as exc:
         raise HTTPException(415, str(exc)) from exc
+    except UnreadableFile as exc:
+        raise HTTPException(422, str(exc)) from exc
     chunks = chunk_pages(pages, settings.chunk_max_chars, settings.chunk_overlap_chars)
     if not chunks:
         raise HTTPException(422, "No extractable text found. Scanned PDFs need OCR, which is not supported yet.")
@@ -157,16 +177,22 @@ def upload_document(
     # so chunks like "It is 24 days per year" still carry document context.
     vectors = embed_passages([f"{filename}\n{c.content}" for c in chunks])
 
-    with db.get_conn() as conn, conn.transaction():
-        doc_id = conn.execute(
-            "INSERT INTO documents (filename, sha256, num_chunks, access_group) VALUES (%s, %s, %s, %s) RETURNING id",
-            (filename, digest, len(chunks), access_group),
-        ).fetchone()[0]
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO chunks (document_id, chunk_index, page, content, embedding) VALUES (%s, %s, %s, %s, %s)",
-                [(doc_id, c.index, c.page, c.content, v) for c, v in zip(chunks, vectors, strict=True)],
-            )
+    try:
+        with db.get_conn() as conn, conn.transaction():
+            doc_id = conn.execute(
+                "INSERT INTO documents (filename, sha256, num_chunks, access_group) VALUES (%s, %s, %s, %s)"
+                " RETURNING id",
+                (filename, digest, len(chunks), access_group),
+            ).fetchone()[0]
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO chunks (document_id, chunk_index, page, content, embedding)"
+                    " VALUES (%s, %s, %s, %s, %s)",
+                    [(doc_id, c.index, c.page, c.content, v) for c, v in zip(chunks, vectors, strict=True)],
+                )
+    except psycopg.errors.UniqueViolation as exc:
+        # The same file was indexed by a concurrent request after our duplicate check.
+        raise HTTPException(409, "This file was just indexed by another request. Retry to see it.") from exc
 
     log.info(
         "ingested %s into %s: %d pages, %d chunks in %d ms", filename, access_group, len(pages), len(chunks), _ms(start)
@@ -221,12 +247,12 @@ def ask(req: AskRequest, principal: Principal = Caller) -> AskResponse:
         raise HTTPException(503, str(exc)) from exc
     except openai.APIError as exc:  # provider failure (bad model, rate limit, outage): report it, don't 500
         log.warning("generation failed: %s", exc)
-        raise HTTPException(502, f"LLM provider error: {exc}") from exc
+        raise HTTPException(502, _provider_error(exc)) from exc
     timings["generation"] = _ms(t1)
     timings["total"] = _ms(t0)
 
     cited = llm.cited_indices(answer, len(hits))
-    answered = llm.REFUSAL.lower().rstrip(".") not in answer.lower()
+    answered = not llm.is_refusal(answer)
     return AskResponse(answer=answer, answered=answered, sources=_sources(hits, cited), timings_ms=timings)
 
 
@@ -255,9 +281,11 @@ def ask_stream(req: AskRequest, principal: Principal = Caller) -> StreamingRespo
                 yield _sse("token", {"text": text})
         except Exception as exc:  # surface the failure to the client instead of a silent cut-off
             log.exception("generation failed")
-            yield _sse("error", {"message": str(exc)})
+            yield _sse("error", {"message": _provider_error(exc)})
             return
 
-        yield _sse("done", {"answered": True, "cited": llm.cited_indices(answer, len(hits)), "total_ms": _ms(t0)})
+        answered = not llm.is_refusal(answer)
+        cited = llm.cited_indices(answer, len(hits)) if answered else []
+        yield _sse("done", {"answered": answered, "cited": cited, "total_ms": _ms(t0)})
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

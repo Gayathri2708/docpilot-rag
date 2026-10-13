@@ -123,3 +123,14 @@ def test_engineer_cannot_learn_about_hr_documents_by_reuploading(client):
 def test_requests_without_a_valid_key_are_rejected(client):
     assert client.post("/search", json={"query": "deploys"}).status_code == 401
     assert client.post("/search", json={"query": "deploys"}, headers={"X-API-Key": "nope"}).status_code == 401
+
+
+def test_disabling_demo_keys_revokes_seeded_ones(client):
+    from app.auth import revoke_demo_keys, seed_demo_keys
+
+    try:
+        assert revoke_demo_keys() == 4
+        assert client.get("/documents", headers=ADMIN).status_code == 401
+    finally:
+        seed_demo_keys()  # restore for any later tests
+    assert client.get("/documents", headers=ADMIN).status_code == 200

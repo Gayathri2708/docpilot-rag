@@ -1,4 +1,4 @@
-from app.llm import REFUSAL, SYSTEM_PROMPT, build_messages, cited_indices, is_answerable
+from app.llm import REFUSAL, SYSTEM_PROMPT, build_messages, cited_indices, is_answerable, is_refusal
 from app.retrieval import Hit
 
 
@@ -47,3 +47,10 @@ def test_no_citations():
 def test_gate_uses_best_score_not_first():
     # After fusion or reranking the most similar chunk may not be ranked first.
     assert is_answerable([hit(0.3), hit(0.8)], min_relevance=0.5)
+
+
+def test_is_refusal_handles_curly_apostrophe_and_case():
+    assert is_refusal(REFUSAL)
+    assert is_refusal("I couldn’t find this in the uploaded documents.")
+    assert is_refusal("i COULDN'T find this in the uploaded documents")
+    assert not is_refusal("Employees get 24 days of leave [1].")

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
 
@@ -25,6 +26,10 @@ _PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 
 
 class UnsupportedFileType(ValueError):
+    pass
+
+
+class UnreadableFile(ValueError):
     pass
 
 
@@ -45,8 +50,15 @@ def sha256(data: bytes) -> str:
 def extract_pages(filename: str, data: bytes) -> list[Page]:
     ext = PurePath(filename).suffix.lower()
     if ext == ".pdf":
-        reader = PdfReader(io.BytesIO(data))
-        return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            if reader.is_encrypted:
+                raise UnreadableFile("Password-protected PDFs are not supported.")
+            return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
+        except (PdfReadError, ValueError, KeyError, TypeError) as exc:
+            if isinstance(exc, UnreadableFile):
+                raise
+            raise UnreadableFile("This PDF could not be read. It may be damaged or not a real PDF.") from exc
     if ext in {".txt", ".md"}:
         return [(None, data.decode("utf-8", errors="replace"))]
     raise UnsupportedFileType(f"Unsupported file type '{ext}'. Use one of {sorted(SUPPORTED_EXTENSIONS)}.")

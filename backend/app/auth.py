@@ -66,6 +66,15 @@ def seed_demo_keys() -> None:
             _insert(conn, name, key, groups)
 
 
+def revoke_demo_keys() -> int:
+    """Delete the well-known demo keys, so turning SEED_DEMO_KEYS off also disables ones seeded earlier."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM api_keys WHERE key_hash = ANY(%s)", ([hash_key(k) for k, _ in DEMO_KEYS.values()],)
+        )
+        return cur.rowcount
+
+
 _header = APIKeyHeader(name="X-API-Key", auto_error=False, description="DocPilot API key")
 
 
@@ -89,7 +98,9 @@ def main() -> None:
     args = parser.parse_args()
 
     key = f"dp_{secrets.token_urlsafe(24)}"
-    groups = [g for g in args.groups.split(",") if g]
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    if unknown := sorted(set(groups) - set(ACCESS_GROUPS)):
+        raise SystemExit(f"Unknown access groups: {', '.join(unknown)}. Choose from {', '.join(ACCESS_GROUPS[1:])}.")
     db.apply_schema()
     db.open_pool()
     try:

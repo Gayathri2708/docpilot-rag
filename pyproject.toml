@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
-pythonpath = ["backend", "evals"]
-testpaths = ["backend/tests", "evals"]
+pythonpath = ["backend", "evals", "mcp_server"]
+testpaths = ["backend/tests", "evals", "mcp_server"]
 
 [tool.ruff]
 line-length = 120
@@ -10,4 +10,4 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "run_eval"]
+known-first-party = ["app", "run_eval", "docpilot_mcp"]

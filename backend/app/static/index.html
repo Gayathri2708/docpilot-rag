@@ -78,6 +78,11 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+// FastAPI returns `detail` as a string, or as a list of validation errors.
+const errorText = (data, fallback) =>
+  typeof data?.detail === "string" ? data.detail
+  : Array.isArray(data?.detail) ? data.detail.map((d) => d.msg).join("; ")
+  : fallback;
 const withCites = (s) => esc(s).replace(/[\[【](\d+)[\]】]/g, '<span class="cite">$1</span>');
 
 // The key is kept in this browser only, so it survives a reload. Storage can be unavailable (private mode).
@@ -111,10 +116,10 @@ $("upload").onclick = async () => {
   body.append("access_group", $("group").value);
   try {
     const res = await fetch("/documents", { method: "POST", body, headers: authHeaders() });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     $("uploadStatus").textContent = res.ok
       ? (data.duplicate ? `Already indexed: ${data.filename}` : `Indexed ${data.filename} into ${data.num_chunks} chunks.`)
-      : `Error: ${data.detail}`;
+      : `Error: ${errorText(data, res.statusText)}`;
     loadDocs();
   } finally {
     $("upload").disabled = false;
@@ -148,7 +153,7 @@ $("askForm").onsubmit = async (e) => {
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      $("askStatus").textContent = `Error: ${data.detail || res.statusText}`;
+      $("askStatus").textContent = `Error: ${errorText(data, res.statusText)}`;
       return;
     }
     const reader = res.body.getReader();

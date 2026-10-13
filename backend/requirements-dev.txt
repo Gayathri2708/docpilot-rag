@@ -1,3 +1,4 @@
 -r requirements.txt
+-r ../mcp_server/requirements.txt
 pytest>=8.0
 ruff>=0.6

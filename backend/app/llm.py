@@ -55,6 +55,13 @@ def build_messages(question: str, hits: list[Hit]) -> list[dict]:
     ]
 
 
+def is_refusal(answer: str) -> bool:
+    """True if the model answered with the refusal sentence. Normalises the curly apostrophe
+    (couldn’t) that many models emit, which a plain substring check misses."""
+    normalised = answer.replace("\u2019", "'").lower()
+    return REFUSAL.lower().rstrip(".") in normalised
+
+
 def cited_indices(answer: str, num_sources: int) -> list[int]:
     """1-based source numbers the answer actually cites, in order, ignoring invalid ones."""
     seen: list[int] = []

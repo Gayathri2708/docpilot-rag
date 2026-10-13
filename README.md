@@ -42,9 +42,10 @@ flowchart LR
 - **Access control (RBAC):** every document belongs to an access group (`all`, `hr`, `finance`, `engineering`); every API key maps to the groups it may read. Retrieval filters by group inside SQL, so restricted chunks never reach the reranker or the LLM. See [Security](#security).
 - **Prompt-injection guard:** retrieved text is labelled untrusted data in the system prompt, and a dedicated injection test set measures whether answers obey planted instructions.
 - **Streaming:** Server-Sent Events (`sources` → `token`… → `done` / `error`).
+- **MCP server:** search and question your documents from Claude Desktop or any MCP client, through the same API keys and access groups. See [Use it from Claude Desktop (MCP)](#use-it-from-claude-desktop-mcp).
 - **Observability:** per-request timings for retrieval and generation.
-- **Provider-agnostic:** Gemini, OpenAI, Groq or a local Ollama model, switched by configuration only.
-- **Evaluation harness:** retrieval hit@1, hit@k and MRR, answer accuracy, refusal accuracy, false-refusal rate, citation rate and latency p50/p95.
+- **Provider-agnostic:** Gemini, OpenAI, Groq or a local Ollama model, switched by configuration only (examples in `.env.example`).
+- **Evaluation harness:** retrieval hit@1, hit@k and MRR, answer accuracy, refusal accuracy, false-refusal rate, citation rate, prompt-injection resistance, and retrieval and end-to-end latency p50/p95.
 - **Tests and CI:** unit and API tests run without a database or API key; integration tests prove access control against real Postgres; a retrieval eval gate fails the build if quality drops. See [CI](#ci).
 
 ## Quickstart
@@ -82,7 +83,7 @@ uvicorn app.main:app --reload
 ```
 
 Open http://localhost:8000 for the UI, or http://localhost:8000/docs for the interactive API docs. Every endpoint except `/health` needs an API key: paste a demo key (below) into the UI, or click **Authorize** in `/docs`.
-The first upload downloads the embedding model (~130 MB) once; the first reranked query downloads the reranker (~80 MB).
+The embedding model and the reranker (about 150 MB together) download once, on first use.
 
 ## API
 
@@ -94,14 +95,51 @@ The first upload downloads the embedding model (~130 MB) once; the first reranke
 | `POST` | `/search` | Retrieval only: `{"query", "top_k", "mode", "rerank"}` |
 | `POST` | `/ask` | Answer with sources and timings: `{"question", "top_k", "mode", "rerank"}` |
 | `POST` | `/ask/stream` | Same, streamed as Server-Sent Events |
-| `GET` | `/health` | Database and LLM configuration status |
+| `GET` | `/health` | Database and LLM configuration status (`503` if the database is unreachable) |
 
-All endpoints except `/health` require an `X-API-Key` header and return `401` without a valid one. `mode` (`"vector"` or `"hybrid"`) and `rerank` (`true` / `false`) are optional and default to `RETRIEVAL_MODE` and `RERANK`.
+All endpoints except `/health` require an `X-API-Key` header and return `401` without a valid one. Uploads return `415` for unsupported file types, `422` for empty, unreadable or password-protected files, and `409` if an identical file is already indexed in a group the key can't read. `mode` (`"vector"` or `"hybrid"`) and `rerank` (`true` / `false`) are optional and default to `RETRIEVAL_MODE` and `RERANK`.
 
 ```bash
 curl -s localhost:8000/ask -H 'X-API-Key: dp_demo_hr' -H 'Content-Type: application/json' \
   -d '{"question": "How many days of paid leave do employees get?", "mode": "hybrid"}'
 ```
+
+LLM provider failures return `502` with a short reason (for example a rate limit). The provider's full error, which can include account details, is written to the server log only.
+
+## Use it from Claude Desktop (MCP)
+
+[`mcp_server/docpilot_mcp.py`](mcp_server/docpilot_mcp.py) is a [Model Context Protocol](https://modelcontextprotocol.io) server built with the official Python SDK's `MCPServer` (the high-level API formerly called FastMCP). It exposes three read-only tools:
+
+| Tool | What it does |
+|---|---|
+| `ask_documents(question, top_k=5)` | Cited answer, or an explicit "not found" when the documents don't contain it |
+| `search_documents(query, top_k=5)` | The most relevant passages, with source, page and relevance |
+| `list_documents()` | The documents this key can see |
+
+It calls the DocPilot API rather than the database, so the API key's access groups apply: with `dp_demo_engineering`, Claude cannot see HR-only documents.
+
+1. Start DocPilot (see [Quickstart](#quickstart)). The MCP server's dependencies are already in `requirements-dev.txt`.
+2. Open Claude Desktop → **Settings → Developer → Edit Config**, which opens `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`). Add:
+
+   ```json
+   {
+     "mcpServers": {
+       "docpilot": {
+         "command": "/ABSOLUTE/PATH/TO/docpilot/backend/.venv/bin/python",
+         "args": ["/ABSOLUTE/PATH/TO/docpilot/mcp_server/docpilot_mcp.py"],
+         "env": {
+           "DOCPILOT_URL": "http://localhost:8000",
+           "DOCPILOT_API_KEY": "dp_demo_hr"
+         }
+       }
+     }
+   }
+   ```
+
+   Use absolute paths; on Windows the Python path is `...\backend\.venv\Scripts\python.exe`.
+3. Restart Claude Desktop. The DocPilot tools appear in the tools menu. Ask, for example, "Using DocPilot, how many days of paid leave do employees get?"
+
+The server runs over stdio. Tests in [`mcp_server/test_docpilot_mcp.py`](mcp_server/test_docpilot_mcp.py) drive it through a real MCP client session with the HTTP API stubbed.
 
 ## Security
 
@@ -109,12 +147,12 @@ curl -s localhost:8000/ask -H 'X-API-Key: dp_demo_hr' -H 'Content-Type: applicat
 
 - **Access groups.** Each document is uploaded into one group: `all` (everyone), `hr`, `finance` or `engineering`. Each API key lists the groups it may read and write; every key can also read `all`.
 - **Keys are hashed.** The `api_keys` table stores only the SHA-256 of each key, never the key itself. Create a key with `python -m app.auth create-key finance-bot --groups finance` (run from `backend/`); it is printed once.
-- **Demo keys.** On startup DocPilot seeds four well-known keys for local use: `dp_demo_admin` (all groups), `dp_demo_hr`, `dp_demo_finance` and `dp_demo_engineering`. Set `SEED_DEMO_KEYS=false` anywhere real.
-- **Filtering happens in SQL, before ranking.** Both retrievers have `WHERE d.access_group = ANY(:groups)`, so restricted chunks are never scored, fused, reranked, returned by `/search` or put in an LLM prompt by `/ask` and `/ask/stream`. Filtering after retrieval would also hurt quality, because restricted chunks would use up the top-k slots.
+- **Demo keys.** On startup DocPilot seeds four well-known keys for local use: `dp_demo_admin` (all groups), `dp_demo_hr`, `dp_demo_finance` and `dp_demo_engineering`, and logs a warning. Set `SEED_DEMO_KEYS=false` anywhere real: startup then deletes any demo keys seeded earlier, so they stop working.
+- **Filtering happens in SQL, before ranking.** Both retrievers have `WHERE d.access_group = ANY(%(groups)s)`, so restricted chunks are never scored, fused, reranked, returned by `/search` or put in an LLM prompt by `/ask` and `/ask/stream`. Filtering after retrieval would also hurt quality, because restricted chunks would use up the top-k slots.
 - **Filtered vector search still returns k results.** HNSW indexes apply `WHERE` clauses after the index scan, so a restrictive filter can silently return fewer than k chunks. Each connection sets `hnsw.iterative_scan = strict_order` (pgvector 0.8+) so the scan continues until enough rows pass the filter.
 - **No information leaks through side doors.** Listing and deleting are scoped to the key's groups. Deleting a document you can't see returns `404`, not `403`. Re-uploading a restricted file returns `409` without its name.
 
-**Tested end to end.** [`test_rbac_integration.py`](backend/tests/test_rbac_integration.py) runs against real Postgres and real embeddings. It indexes an HR-only document containing a unique canary string, then shows that an engineering key cannot reach it through `/search` (vector and hybrid), `/ask`, `/ask/stream`, listing, deleting or re-uploading. A stubbed LLM records every prompt, so the test checks that the canary never appears in what would be sent to the model. Removing the SQL filter makes four of these tests fail.
+**Tested end to end.** [`test_rbac_integration.py`](backend/tests/test_rbac_integration.py) runs against real Postgres and real embeddings. It indexes an HR-only document containing a unique canary string, then shows that an engineering key cannot reach it through `/search` (vector and hybrid), `/ask`, `/ask/stream`, listing, deleting or re-uploading. A stubbed LLM records every prompt, so the test checks that the canary never appears in what would be sent to the model. Removing the SQL filter makes four of these tests fail. Another test checks that `SEED_DEMO_KEYS=false` revokes the demo keys.
 
 ### Prompt injection
 
@@ -133,6 +171,7 @@ python evals/run_eval.py --golden evals/injection.jsonl --upload evals/injection
 ### Known limitations
 
 - API keys are bearer secrets with no expiry or rotation endpoint yet, and there is no rate limiting or audit log.
+- Any key may upload to the shared `all` group, which every key can read. Anyone with a key can therefore add content (including injection attempts) that other users retrieve.
 - Access groups are a fixed list; per-tenant isolation with Postgres row-level security is on the roadmap.
 - The injection set covers common attack styles, not every possible one. A model that resists them can still be fooled by new phrasing.
 
@@ -163,11 +202,11 @@ python evals/run_eval.py --mode hybrid
 python evals/run_eval.py --mode hybrid+rerank --retrieval-only
 ```
 
-Each run prints a per-question PASS/FAIL list and saves a JSON report to `evals/results/`.
+Each run prints a per-question result (PASS/FAIL, or the evidence rank with `--retrieval-only`) and saves a JSON report to `evals/results/`, which is git-ignored.
 
 ### Results
 
-60 cases (48 answerable, 12 unanswerable), `top_k=5`, measured on 13 Oct 2026. Saved runs are in `evals/results/`; the CI floor is in `evals/baseline.json`.
+60 cases (48 answerable, 12 unanswerable), `top_k=5`, measured on 13 Oct 2026. The CI floor for the retrieval numbers is in `evals/baseline.json`, and CI reproduces them exactly on Linux.
 
 **Retrieval: vector vs hybrid vs hybrid + rerank** (retrieval-only, deterministic, no LLM)
 
@@ -219,6 +258,7 @@ Notes:
 - [ ] LLM-as-judge faithfulness scoring in the eval harness
 - [x] API keys and access groups, enforced in SQL
 - [x] CI eval regression gate and prompt-injection test set
+- [x] MCP server for Claude Desktop and other MCP clients
 - [ ] Multi-tenancy: organizations, key rotation, Postgres row-level security
 - [ ] Async ingestion workers for large files
 - [ ] Tracing with Langfuse / OpenTelemetry; semantic caching
@@ -231,6 +271,7 @@ backend/app/        FastAPI service: config, db, auth, ingest, embeddings, retri
 backend/tests/      unit and API tests (no DB or LLM needed); RBAC integration tests (need TEST_DATABASE_URL)
 evals/              golden set, sample documents, eval harness, baseline and its tests
 evals/injection*    prompt-injection documents and questions
+mcp_server/         MCP server (search / ask / list tools) and its tests
 docker-compose.yml  Postgres 16 + pgvector
 ```
 

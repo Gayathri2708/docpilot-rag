@@ -117,24 +117,72 @@ def test_stream_reports_generation_errors(relevant, monkeypatch):
 
     monkeypatch.setattr(llm, "stream", broken)
     events = _events(client.post("/ask/stream", json={"question": "How much leave?"}).text)
-    assert events[-1] == ("error", {"message": "provider timeout"})
+    assert events[-1][0] == "error"
+    assert "RuntimeError" in events[-1][1]["message"]
+    assert "provider timeout" not in events[-1][1]["message"]  # details stay in the server log
+
+
+def test_provider_error_details_are_not_returned_to_clients(relevant, monkeypatch):
+    def rate_limited(_):
+        raise openai.RateLimitError(
+            "Rate limit reached in organization org_SECRET123 on tokens per day",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://llm.example/chat")),
+            body=None,
+        )
+
+    monkeypatch.setattr(llm, "complete", rate_limited)
+    resp = client.post("/ask", json={"question": "How much leave?"})
+    assert resp.status_code == 502
+    assert "rate limit" in resp.json()["detail"]
+    assert "org_SECRET123" not in resp.text
+
+
+def test_stream_reports_model_refusal_as_not_answered(relevant, monkeypatch):
+    monkeypatch.setattr(llm, "stream", lambda messages: iter(["I couldn’t find this in the uploaded documents."]))
+    events = _events(client.post("/ask/stream", json={"question": "Dress code?"}).text)
+    assert events[-1][0] == "done"
+    assert events[-1][1]["answered"] is False
+    assert events[-1][1]["cited"] == []
+
+
+def test_curly_apostrophe_refusal_is_not_answered(relevant, monkeypatch):
+    monkeypatch.setattr(llm, "complete", lambda messages: "I couldn’t find this in the uploaded documents.")
+    assert client.post("/ask", json={"question": "Dress code?"}).json()["answered"] is False
+
+
+def test_unreadable_pdf_is_rejected_with_422(monkeypatch):
+    monkeypatch.setattr(main.db, "get_conn", lambda: _NoDuplicateConn())
+    res = client.post("/documents", files={"file": ("broken.pdf", b"%PDF-1.4 not really a pdf")})
+    assert res.status_code == 422
+    assert "could not be read" in res.json()["detail"]
+
+
+def test_health_returns_503_when_database_is_down(monkeypatch):
+    def down():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(main.db, "get_conn", down)
+    resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["database"] is False
+
+
+class _NoDuplicateConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *args):
+        return self
+
+    def fetchone(self):
+        return None
 
 
 def test_unsupported_upload_is_rejected(monkeypatch):
-    class NoDuplicate:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def execute(self, *args):
-            return self
-
-        def fetchone(self):
-            return None
-
-    monkeypatch.setattr(main.db, "get_conn", lambda: NoDuplicate())
+    monkeypatch.setattr(main.db, "get_conn", lambda: _NoDuplicateConn())
     res = client.post("/documents", files={"file": ("photo.png", b"\x89PNG data")})
     assert res.status_code == 415
 
