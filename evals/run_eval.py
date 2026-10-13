@@ -1,17 +1,19 @@
 """DocPilot evaluation harness.
 
 Runs every question in a golden set against a running DocPilot API and reports:
-  - Retrieval hit@k and MRR      : did the chunk containing the evidence come back, and how high?
+  - Retrieval hit@1, hit@k, MRR  : did the chunk containing the evidence come back, and how high?
   - Answer accuracy              : answerable questions whose answer contains the expected facts
   - Refusal accuracy             : unanswerable questions correctly refused (no hallucination)
   - False refusals               : answerable questions the system wrongly refused
   - Citation rate                : answered questions that cite at least one source
-  - Latency p50 / p95
+  - Latency p50 / p95, for retrieval alone and for the full /ask call
 
 Usage (API running on localhost:8000):
     python evals/run_eval.py --upload evals/sample_docs/northwind_handbook.md
     python evals/run_eval.py --top-k 3 --label "k=3"
     python evals/run_eval.py --delay 13   # stay under a 5 requests/minute free-tier LLM quota
+    python evals/run_eval.py --mode hybrid+rerank
+    python evals/run_eval.py --mode hybrid --retrieval-only   # no LLM calls
 
 Results are written to evals/results/<timestamp>.json so runs can be compared.
 """
@@ -80,12 +82,15 @@ class CaseResult:
     refused: bool
     cited: bool
     latency_ms: int
+    retrieval_ms: int
 
 
 @dataclass
 class Report:
     label: str
     top_k: int
+    mode: str = "vector"
+    retrieval_only: bool = False
     cases: list[CaseResult] = field(default_factory=list)
 
     def summary(self) -> dict:
@@ -93,16 +98,25 @@ class Report:
         unans = [c for c in self.cases if not c.answerable]
         answered = [c for c in self.cases if not c.refused]
         latencies = [c.latency_ms for c in self.cases]
+        retrieval_latencies = [c.retrieval_ms for c in self.cases]
 
         def ratio(n: int, d: int) -> float:
             return round(n / d, 3) if d else 0.0
 
-        return {
+        retrieval = {
             "cases": len(self.cases),
+            "retrieval_hit_at_1": ratio(sum(c.retrieval_rank == 1 for c in ans), len(ans)),
             "retrieval_hit_at_k": ratio(sum(c.retrieval_rank is not None for c in ans), len(ans)),
             "retrieval_mrr": round(
                 statistics.fmean([1 / c.retrieval_rank if c.retrieval_rank else 0 for c in ans]), 3
             ) if ans else 0.0,
+            "retrieval_p50_ms": percentile(retrieval_latencies, 50),
+            "retrieval_p95_ms": percentile(retrieval_latencies, 95),
+        }
+        if self.retrieval_only:
+            return retrieval
+        return {
+            **retrieval,
             "answer_accuracy": ratio(sum(c.correct for c in ans), len(ans)),
             "refusal_accuracy": ratio(sum(c.refused for c in unans), len(unans)),
             "false_refusal_rate": ratio(sum(c.refused for c in ans), len(ans)),
@@ -120,12 +134,22 @@ def load_golden(path: Path) -> list[dict]:
 RETRYABLE_STATUS = {429, 502}
 
 
-def ask_with_retry(client: httpx.Client, question: str, top_k: int, retries: int = 5) -> tuple[dict, int]:
+# --mode values -> request options. rerank is always explicit so the server's RERANK default can't leak in.
+MODES = {
+    "vector": {"mode": "vector", "rerank": False},
+    "hybrid": {"mode": "hybrid", "rerank": False},
+    "hybrid+rerank": {"mode": "hybrid", "rerank": True},
+}
+
+
+def ask_with_retry(
+    client: httpx.Client, question: str, top_k: int, options: dict | None = None, retries: int = 5
+) -> tuple[dict, int]:
     """POST /ask, retrying rate-limit and provider errors with exponential backoff (15s, 30s, 60s, ...).
     Returns the response body and the latency of the successful attempt only, so backoff waits don't skew p95."""
     for attempt in range(retries + 1):
         start = time.perf_counter()
-        resp = client.post("/ask", json={"question": question, "top_k": top_k})
+        resp = client.post("/ask", json={"question": question, "top_k": top_k, **(options or {})})
         latency = round((time.perf_counter() - start) * 1000)
         if resp.status_code not in RETRYABLE_STATUS or attempt == retries:
             return resp.raise_for_status().json(), latency
@@ -135,16 +159,38 @@ def ask_with_retry(client: httpx.Client, question: str, top_k: int, retries: int
     raise AssertionError("unreachable")
 
 
-def run(base_url: str, golden: list[dict], top_k: int, label: str, delay: float = 0) -> Report:
-    report = Report(label=label, top_k=top_k)
+def run(
+    base_url: str,
+    golden: list[dict],
+    top_k: int,
+    label: str,
+    delay: float = 0,
+    mode: str = "vector",
+    retrieval_only: bool = False,
+) -> Report:
+    options = MODES[mode]
+    report = Report(label=label, top_k=top_k, mode=mode, retrieval_only=retrieval_only)
     with httpx.Client(base_url=base_url, timeout=120) as client:
         for i, case in enumerate(golden):
-            if i and delay:
+            if i and delay and not retrieval_only:
                 time.sleep(delay)
-            hits = client.post("/search", json={"query": case["question"], "top_k": top_k}).raise_for_status().json()
+            start = time.perf_counter()
+            hits = client.post(
+                "/search", json={"query": case["question"], "top_k": top_k, **options}
+            ).raise_for_status().json()
+            retrieval_ms = round((time.perf_counter() - start) * 1000)
             rank = evidence_rank(case["evidence"], [h["content"] for h in hits]) if case["evidence"] else None
 
-            resp, latency = ask_with_retry(client, case["question"], top_k)
+            if retrieval_only:
+                report.cases.append(CaseResult(
+                    id=case["id"], question=case["question"], answerable=case["answerable"], answer="",
+                    retrieval_rank=rank, correct=False, refused=False, cited=False, latency_ms=0,
+                    retrieval_ms=retrieval_ms,
+                ))
+                print(f"  {case['id']:<24} rank={rank}  {retrieval_ms} ms", flush=True)
+                continue
+
+            resp, latency = ask_with_retry(client, case["question"], top_k, options)
 
             refused = (not resp["answered"]) or is_refusal(resp["answer"])
             if case["answerable"]:
@@ -161,6 +207,7 @@ def run(base_url: str, golden: list[dict], top_k: int, label: str, delay: float 
                 refused=refused,
                 cited=any(s["cited"] for s in resp["sources"]),
                 latency_ms=latency,
+                retrieval_ms=retrieval_ms,
             ))
             status = "PASS" if correct else "FAIL"
             print(f"  {status}  {case['id']:<20} rank={rank}  {latency} ms", flush=True)
@@ -183,16 +230,19 @@ def main() -> None:
     parser.add_argument("--upload", type=Path, nargs="*", default=[], help="documents to index before evaluating")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--delay", type=float, default=0, help="seconds between cases, for rate-limited LLM tiers")
-    parser.add_argument("--label", default="baseline", help="name for this run, e.g. 'k=3' or 'hybrid-search'")
+    parser.add_argument("--mode", choices=MODES, default="vector", help="retrieval mode to evaluate")
+    parser.add_argument("--retrieval-only", action="store_true", help="measure retrieval only; no LLM calls")
+    parser.add_argument("--label", help="name for this run, e.g. 'k=3'; defaults to the mode")
     parser.add_argument("--out-dir", type=Path, default=HERE / "results")
     args = parser.parse_args()
 
     if args.upload:
         upload(args.base_url, args.upload)
 
+    label = args.label or args.mode
     golden = load_golden(args.golden)
-    print(f"Running {len(golden)} cases (top_k={args.top_k}, label={args.label})")
-    report = run(args.base_url, golden, args.top_k, args.label, args.delay)
+    print(f"Running {len(golden)} cases (top_k={args.top_k}, mode={args.mode}, label={label})")
+    report = run(args.base_url, golden, args.top_k, label, args.delay, args.mode, args.retrieval_only)
     summary = report.summary()
 
     print("\nResults")
@@ -200,9 +250,15 @@ def main() -> None:
         print(f"  {key:<22} {value}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    out = args.out_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{args.label.replace(' ', '_')}.json"
+    out = args.out_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{label.replace(' ', '_').replace('+', '_')}.json"
     out.write_text(json.dumps(
-        {"label": report.label, "top_k": report.top_k, "summary": summary, "cases": [asdict(c) for c in report.cases]},
+        {
+            "label": report.label,
+            "mode": report.mode,
+            "top_k": report.top_k,
+            "summary": summary,
+            "cases": [asdict(c) for c in report.cases],
+        },
         indent=2, ensure_ascii=False,
     ))
     print(f"\nSaved {out}")

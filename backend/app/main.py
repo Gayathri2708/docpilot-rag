@@ -15,7 +15,7 @@ from . import db, llm
 from .config import settings
 from .embeddings import embed_passages
 from .ingest import UnsupportedFileType, chunk_pages, extract_pages, sha256
-from .retrieval import Hit, search
+from .retrieval import Hit, Mode, search
 
 log = logging.getLogger("docpilot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -45,11 +45,15 @@ class DocumentOut(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=settings.top_k, ge=1, le=20)
+    mode: Mode | None = Field(default=None, description="vector or hybrid; defaults to RETRIEVAL_MODE")
+    rerank: bool | None = Field(default=None, description="cross-encoder reranking; defaults to RERANK")
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=settings.top_k, ge=1, le=20)
+    mode: Mode | None = Field(default=None, description="vector or hybrid; defaults to RETRIEVAL_MODE")
+    rerank: bool | None = Field(default=None, description="cross-encoder reranking; defaults to RERANK")
 
 
 class Source(BaseModel):
@@ -158,13 +162,13 @@ def delete_document(document_id: str) -> Response:
 @app.post("/search")
 def search_chunks(req: SearchRequest) -> list[dict]:
     """Retrieval only, no LLM. Used by the eval harness to measure retrieval quality."""
-    return [h.to_dict() for h in search(req.query, req.top_k)]
+    return [h.to_dict() for h in search(req.query, req.top_k, req.mode, req.rerank)]
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     t0 = time.perf_counter()
-    hits = search(req.question, req.top_k)
+    hits = search(req.question, req.top_k, req.mode, req.rerank)
     timings = {"retrieval": _ms(t0)}
 
     if not llm.is_answerable(hits, settings.min_relevance):
@@ -197,7 +201,7 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
 
     def events() -> Iterator[str]:
         t0 = time.perf_counter()
-        hits = search(req.question, req.top_k)
+        hits = search(req.question, req.top_k, req.mode, req.rerank)
         yield _sse("sources", {"sources": [s.model_dump() for s in _sources(hits, [])]})
 
         if not llm.is_answerable(hits, settings.min_relevance):

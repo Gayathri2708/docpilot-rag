@@ -42,3 +42,8 @@ def test_cited_indices_accepts_full_width_brackets():
 
 def test_no_citations():
     assert cited_indices(REFUSAL, num_sources=5) == []
+
+
+def test_gate_uses_best_score_not_first():
+    # After fusion or reranking the most similar chunk may not be ranked first.
+    assert is_answerable([hit(0.3), hit(0.8)], min_relevance=0.5)

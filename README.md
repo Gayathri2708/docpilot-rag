@@ -1,8 +1,8 @@
 # DocPilot
 
-**Ask questions about your documents and get answers that cite their sources, and refuse when the answer isn't there.**
+**Ask questions about your organisation's documents and get answers that cite their sources, and refuse when the answer isn't there.**
 
-DocPilot is a retrieval-augmented generation (RAG) service built with FastAPI, PostgreSQL + pgvector and any OpenAI-compatible LLM. It ships with an evaluation harness so retrieval and answer quality are measured, not guessed.
+DocPilot is a general-purpose retrieval-augmented generation (RAG) service for any company's documents: HR policies, handbooks, product docs, runbooks, contracts. Upload PDFs, Markdown or text files and ask questions in plain language. It is built with FastAPI, PostgreSQL + pgvector and any OpenAI-compatible LLM, and ships with an evaluation harness so retrieval and answer quality are measured, not guessed.
 
 ![CI](https://github.com/Gayathri2708/docpilot-rag/actions/workflows/ci.yml/badge.svg)
 
@@ -16,8 +16,10 @@ flowchart LR
     C --> E[Local embeddings<br/>bge-small, fastembed]
     E --> DB[(Postgres + pgvector<br/>HNSW index)]
 
-    U -->|question| R[Retrieval<br/>top-k cosine search]
+    U -->|question| R[Hybrid retrieval<br/>vector + keyword, RRF]
     DB --> R
+    R -.->|optional| RR[Cross-encoder<br/>reranker]
+    RR -.-> G
     R --> G{Relevance gate}
     G -->|below threshold| N[Refuse<br/>no LLM call]
     G -->|relevant| L[LLM with numbered sources<br/>streamed via SSE]
@@ -32,36 +34,53 @@ flowchart LR
 - **Ingestion:** PDF, TXT and Markdown; duplicate uploads detected by SHA-256.
 - **Chunking:** sentence-aware packing with overlap; chunks never cross pages, so every citation points to one page.
 - **Embeddings:** local `BAAI/bge-small-en-v1.5` via fastembed: free, CPU-only, no PyTorch.
-- **Vector search:** pgvector with an HNSW index. A `tsvector` column and GIN index are already in place for hybrid search.
+- **Hybrid search:** pgvector cosine search (HNSW index) plus Postgres full-text search (`tsvector`, GIN index, `ts_rank_cd`), merged with Reciprocal Rank Fusion. Keyword search catches exact terms embeddings blur, such as policy codes, product names and numbers. `RETRIEVAL_MODE=vector|hybrid`, or per request.
+- **Reranker (optional):** a local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-orders the top 20 candidates. `RERANK=true|false`, or per request.
 - **Grounded answers:** numbered sources in the prompt, mandatory `[n]` citations, exact refusal sentence when the answer isn't in the sources.
 - **Relevance gate:** if the best chunk scores below `MIN_RELEVANCE`, DocPilot refuses without calling the LLM. This cuts cost and removes a whole class of hallucinations.
 - **Prompt-injection guard:** retrieved text is labelled untrusted data in the system prompt.
 - **Streaming:** Server-Sent Events (`sources` → `token`… → `done` / `error`).
 - **Observability:** per-request timings for retrieval and generation.
 - **Provider-agnostic:** Gemini, OpenAI, Groq or a local Ollama model, switched by configuration only.
-- **Evaluation harness:** retrieval hit@k and MRR, answer accuracy, refusal accuracy, false-refusal rate, citation rate and latency p50/p95.
+- **Evaluation harness:** retrieval hit@1, hit@k and MRR, answer accuracy, refusal accuracy, false-refusal rate, citation rate and latency p50/p95.
 - **Tests and CI:** unit and API tests run without a database or API key; GitHub Actions runs ruff and pytest on every push.
 
 ## Quickstart
 
-Requirements: Python 3.11+, Docker.
+Requirements: Python 3.11+, and Postgres with pgvector, from either Docker or Homebrew.
+
+**1a. Postgres with Docker**
 
 ```bash
-# 1. Start Postgres with pgvector
 docker compose up -d
+```
 
-# 2. Install and configure
+**1b. Postgres with Homebrew (macOS, no Docker)**
+
+```bash
+brew install postgresql@17 pgvector
+brew services start postgresql@17
+export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+
+psql postgres -c "CREATE ROLE docpilot LOGIN PASSWORD 'docpilot'"
+createdb -O docpilot docpilot
+psql docpilot -c "CREATE EXTENSION vector"   # needs your admin user; the app's role doesn't need superuser
+```
+
+Both options match the default `DATABASE_URL` in `.env.example`.
+
+**2. Install, configure and run**
+
+```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
-cp .env.example .env        # then add LLM_API_KEY (a free Gemini key works)
-
-# 3. Run
+cp .env.example .env        # then add LLM_API_KEY (free Groq or Gemini keys work)
 uvicorn app.main:app --reload
 ```
 
 Open http://localhost:8000 for the UI, or http://localhost:8000/docs for the interactive API docs.
-The first upload downloads the embedding model (~130 MB) once.
+The first upload downloads the embedding model (~130 MB) once; the first reranked query downloads the reranker (~80 MB).
 
 ## API
 
@@ -70,12 +89,16 @@ The first upload downloads the embedding model (~130 MB) once.
 | `POST` | `/documents` | Upload and index a file (multipart `file`) |
 | `GET` | `/documents` | List indexed documents |
 | `DELETE` | `/documents/{id}` | Remove a document and its chunks |
-| `POST` | `/search` | Retrieval only: `{"query", "top_k"}` |
-| `POST` | `/ask` | Answer with sources and timings: `{"question", "top_k"}` |
+| `POST` | `/search` | Retrieval only: `{"query", "top_k", "mode", "rerank"}` |
+| `POST` | `/ask` | Answer with sources and timings: `{"question", "top_k", "mode", "rerank"}` |
 | `POST` | `/ask/stream` | Same, streamed as Server-Sent Events |
 | `GET` | `/health` | Database and LLM configuration status |
 
+`mode` (`"vector"` or `"hybrid"`) and `rerank` (`true` / `false`) are optional and default to `RETRIEVAL_MODE` and `RERANK`.
+
 ## Evaluation
+
+The harness works with any document set: write a `golden.jsonl` of questions with the evidence sentence and expected facts, upload your documents, and run it. The repository ships with a sample set:
 
 `evals/sample_docs/` holds five documents from one fictional company, Northwind Labs: an employee handbook, an engineering onboarding guide and a product FAQ (Markdown), and a travel & expense policy and an information security policy (PDF, 4 pages each). They deliberately overlap in topic but not in facts (paid leave vs. leave encashment, domestic vs. international hotel limits, internal P1 incidents vs. customer Priority 1 tickets), so retrieval has to pick the right document, not just the right topic.
 
@@ -86,6 +109,9 @@ The first upload downloads the embedding model (~130 MB) once.
 python evals/run_eval.py --upload evals/sample_docs/*.md evals/sample_docs/*.pdf --label baseline
 # on a rate-limited free LLM tier (e.g. 5 requests/minute), pace the run:
 python evals/run_eval.py --delay 13
+# compare retrieval modes; --retrieval-only skips the LLM entirely
+python evals/run_eval.py --mode hybrid
+python evals/run_eval.py --mode hybrid+rerank --retrieval-only
 ```
 
 Each run prints a per-question PASS/FAIL list and saves a JSON report to `evals/results/`.
@@ -108,20 +134,23 @@ Notes:
 
 1. **Relevance threshold:** sweep `MIN_RELEVANCE` (0.45 → 0.70) and pick the value that keeps refusal accuracy high without raising false refusals.
 2. **Chunk size:** compare `CHUNK_MAX_CHARS` 500 / 1000 / 1500 at `--top-k 3`.
-3. **Hybrid search:** add BM25 over the existing `tsvector` column and measure whether exact-term questions (policy codes, product names) move to rank 1.
+3. **Fusion tuning:** sweep the RRF constant and candidate pool, and try weighting keyword results lower for long paraphrased questions.
+4. **Multi-fact questions:** retrieve per sub-question, or rerank with a larger `top_k`, so both halves of a two-part question survive reranking.
 
 ## Design decisions
 
-- **pgvector over a dedicated vector database.** One datastore for documents, chunks, vectors and (soon) full-text search keeps transactions simple: a document and all its chunks are written atomically, and deletes cascade.
+- **pgvector over a dedicated vector database.** One datastore for documents, chunks, vectors and full-text search keeps transactions simple: a document and all its chunks are written atomically, and deletes cascade.
 - **Local embeddings.** No per-token cost for indexing, no data leaves the machine at ingestion, and re-indexing is free while experimenting with chunking.
 - **Refusal before generation.** A cheap similarity threshold decides whether to call the LLM at all, so unanswerable questions cost nothing and can't be hallucinated.
 - **Filename as a contextual header.** Each chunk is embedded with its document name prepended, so short chunks keep their context.
+- **Rank fusion, not score mixing.** Cosine similarity and `ts_rank_cd` are on unrelated scales, so RRF merges them by rank only (`1 / (60 + rank)` summed over both lists). No weights or normalisation to tune.
+- **The relevance gate always uses cosine similarity.** Fusion and reranking only change the order. Each hit keeps its cosine score, and the gate checks the best one, so `MIN_RELEVANCE` means the same thing in every mode.
 - **Pages as hard chunk boundaries.** Slightly smaller chunks in exchange for citations that always point to a single page.
 
 ## Roadmap
 
 - [ ] Next.js frontend
-- [ ] Hybrid search (BM25 via `tsvector` + vector, reciprocal rank fusion) and a reranker
+- [x] Hybrid search (`tsvector` + vector, reciprocal rank fusion) and a reranker
 - [ ] LLM-as-judge faithfulness scoring in the eval harness
 - [ ] Multi-tenancy: organizations, API keys, Postgres row-level security
 - [ ] Async ingestion workers for large files
@@ -133,7 +162,7 @@ Notes:
 ```
 backend/app/        FastAPI service: config, db, ingest, embeddings, retrieval, llm, main, static UI
 backend/tests/      unit and API tests (no DB or API key needed)
-evals/              golden set, sample document, eval harness and its tests
+evals/              golden set, sample documents, eval harness and its tests
 docker-compose.yml  Postgres 16 + pgvector
 ```
 

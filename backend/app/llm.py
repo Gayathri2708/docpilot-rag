@@ -37,8 +37,9 @@ class LLMNotConfigured(RuntimeError):
 
 def is_answerable(hits: list[Hit], min_relevance: float) -> bool:
     """Retrieval-confidence gate: skip the LLM entirely when nothing relevant was found.
-    Saves cost and removes a whole class of hallucinations."""
-    return bool(hits) and hits[0].score >= min_relevance
+    Saves cost and removes a whole class of hallucinations.
+    Uses the best cosine score, since hybrid fusion or reranking may not put it first."""
+    return bool(hits) and max(h.score for h in hits) >= min_relevance
 
 
 def format_source(index: int, hit: Hit) -> str:

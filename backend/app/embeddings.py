@@ -1,4 +1,4 @@
-"""Local embeddings with fastembed (ONNX, CPU, no API key, no PyTorch).
+"""Local embeddings and reranking with fastembed (ONNX, CPU, no API key, no PyTorch).
 
 The model is loaded lazily on first use and cached for the process lifetime.
 bge models expect different handling for queries vs passages; fastembed's
@@ -19,9 +19,22 @@ def _model():
     return TextEmbedding(model_name=settings.embedding_model)
 
 
+@lru_cache(maxsize=1)
+def _reranker():
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+    return TextCrossEncoder(model_name=settings.rerank_model)
+
+
 def embed_passages(texts: list[str]) -> list[np.ndarray]:
     return [np.asarray(v, dtype=np.float32) for v in _model().passage_embed(texts)]
 
 
 def embed_query(text: str) -> np.ndarray:
     return np.asarray(next(iter(_model().query_embed(text))), dtype=np.float32)
+
+
+def rerank_scores(query: str, passages: list[str]) -> list[float]:
+    """Cross-encoder relevance of each passage to the query (higher is better). Reads query and
+    passage together, so it is slower than embeddings but better at fine distinctions."""
+    return [float(s) for s in _reranker().rerank(query, passages)]

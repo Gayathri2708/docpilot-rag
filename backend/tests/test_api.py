@@ -21,12 +21,13 @@ HITS = [
 
 @pytest.fixture
 def relevant(monkeypatch):
-    monkeypatch.setattr(main, "search", lambda q, k: HITS[:k])
+    monkeypatch.setattr(main, "search", lambda q, k, mode=None, rerank=None: HITS[:k])
 
 
 @pytest.fixture
 def irrelevant(monkeypatch):
-    monkeypatch.setattr(main, "search", lambda q, k: [Hit(3, "d1", "handbook.md", None, 2, "Unrelated.", 0.2)])
+    unrelated = Hit(3, "d1", "handbook.md", None, 2, "Unrelated.", 0.2)
+    monkeypatch.setattr(main, "search", lambda q, k, mode=None, rerank=None: [unrelated])
 
 
 def test_ask_returns_answer_with_cited_sources(relevant, monkeypatch):

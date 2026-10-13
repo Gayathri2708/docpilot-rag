@@ -2,7 +2,18 @@ import httpx
 
 import run_eval
 from app.ingest import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
-from run_eval import HERE, ask_with_retry, evidence_rank, is_refusal, keywords_match, load_golden, normalize, percentile
+from run_eval import (
+    HERE,
+    CaseResult,
+    Report,
+    ask_with_retry,
+    evidence_rank,
+    is_refusal,
+    keywords_match,
+    load_golden,
+    normalize,
+    percentile,
+)
 
 
 def test_keywords_require_every_group():
@@ -56,3 +67,14 @@ def test_ask_retries_rate_limits_with_backoff(monkeypatch):
         body, _ = ask_with_retry(client, "q", 5)
     assert body == {"answer": "ok"}
     assert waits == [15, 30]
+
+
+def test_retrieval_only_summary_reports_ranks_without_answer_metrics():
+    def case(rank):
+        return CaseResult("c", "q", True, "", rank, False, False, False, 0, retrieval_ms=10)
+
+    summary = Report("r", 5, retrieval_only=True, cases=[case(1), case(2), case(None)]).summary()
+    assert summary["retrieval_hit_at_1"] == 0.333
+    assert summary["retrieval_hit_at_k"] == 0.667
+    assert summary["retrieval_mrr"] == 0.5
+    assert "answer_accuracy" not in summary
