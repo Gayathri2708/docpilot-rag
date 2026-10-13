@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     # Any OpenAI-compatible chat API. Defaults to Gemini's free tier.
     llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     llm_api_key: str = ""
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "gemini-3.8-flash"
     llm_temperature: float = 0.1
 
     chunk_max_chars: int = 1000

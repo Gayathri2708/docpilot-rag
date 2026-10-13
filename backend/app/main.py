@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import openai
 from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -175,6 +176,9 @@ def ask(req: AskRequest) -> AskResponse:
         answer = llm.complete(llm.build_messages(req.question, hits))
     except llm.LLMNotConfigured as exc:
         raise HTTPException(503, str(exc)) from exc
+    except openai.APIError as exc:  # provider failure (bad model, rate limit, outage): report it, don't 500
+        log.warning("generation failed: %s", exc)
+        raise HTTPException(502, f"LLM provider error: {exc}") from exc
     timings["generation"] = _ms(t1)
     timings["total"] = _ms(t0)
 

@@ -11,6 +11,7 @@ Runs every question in a golden set against a running DocPilot API and reports:
 Usage (API running on localhost:8000):
     python evals/run_eval.py --upload evals/sample_docs/northwind_handbook.md
     python evals/run_eval.py --top-k 3 --label "k=3"
+    python evals/run_eval.py --delay 13   # stay under a 5 requests/minute free-tier LLM quota
 
 Results are written to evals/results/<timestamp>.json so runs can be compared.
 """
@@ -33,7 +34,7 @@ Keyword = str | list[str]  # a list means "any of these alternatives"
 
 
 def normalize(text: str) -> str:
-    return " ".join(text.replace("’", "'").lower().split())
+    return " ".join(text.replace("’", "'").replace("\u2011", "-").lower().split())
 
 
 def keywords_match(answer: str, keywords: list[Keyword]) -> bool:
@@ -115,16 +116,35 @@ def load_golden(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def run(base_url: str, golden: list[dict], top_k: int, label: str) -> Report:
+# 429 = rate limited; 502 = the API reporting an LLM provider error (it maps the provider's 429 to 502).
+RETRYABLE_STATUS = {429, 502}
+
+
+def ask_with_retry(client: httpx.Client, question: str, top_k: int, retries: int = 5) -> tuple[dict, int]:
+    """POST /ask, retrying rate-limit and provider errors with exponential backoff (15s, 30s, 60s, ...).
+    Returns the response body and the latency of the successful attempt only, so backoff waits don't skew p95."""
+    for attempt in range(retries + 1):
+        start = time.perf_counter()
+        resp = client.post("/ask", json={"question": question, "top_k": top_k})
+        latency = round((time.perf_counter() - start) * 1000)
+        if resp.status_code not in RETRYABLE_STATUS or attempt == retries:
+            return resp.raise_for_status().json(), latency
+        wait = min(15 * 2**attempt, 240)
+        print(f"    HTTP {resp.status_code}, retrying in {wait}s", flush=True)
+        time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def run(base_url: str, golden: list[dict], top_k: int, label: str, delay: float = 0) -> Report:
     report = Report(label=label, top_k=top_k)
     with httpx.Client(base_url=base_url, timeout=120) as client:
-        for case in golden:
+        for i, case in enumerate(golden):
+            if i and delay:
+                time.sleep(delay)
             hits = client.post("/search", json={"query": case["question"], "top_k": top_k}).raise_for_status().json()
             rank = evidence_rank(case["evidence"], [h["content"] for h in hits]) if case["evidence"] else None
 
-            start = time.perf_counter()
-            resp = client.post("/ask", json={"question": case["question"], "top_k": top_k}).raise_for_status().json()
-            latency = round((time.perf_counter() - start) * 1000)
+            resp, latency = ask_with_retry(client, case["question"], top_k)
 
             refused = (not resp["answered"]) or is_refusal(resp["answer"])
             if case["answerable"]:
@@ -143,7 +163,7 @@ def run(base_url: str, golden: list[dict], top_k: int, label: str) -> Report:
                 latency_ms=latency,
             ))
             status = "PASS" if correct else "FAIL"
-            print(f"  {status}  {case['id']:<20} rank={rank}  {latency} ms")
+            print(f"  {status}  {case['id']:<20} rank={rank}  {latency} ms", flush=True)
     return report
 
 
@@ -162,6 +182,7 @@ def main() -> None:
     parser.add_argument("--golden", type=Path, default=HERE / "golden.jsonl")
     parser.add_argument("--upload", type=Path, nargs="*", default=[], help="documents to index before evaluating")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--delay", type=float, default=0, help="seconds between cases, for rate-limited LLM tiers")
     parser.add_argument("--label", default="baseline", help="name for this run, e.g. 'k=3' or 'hybrid-search'")
     parser.add_argument("--out-dir", type=Path, default=HERE / "results")
     args = parser.parse_args()
@@ -171,7 +192,7 @@ def main() -> None:
 
     golden = load_golden(args.golden)
     print(f"Running {len(golden)} cases (top_k={args.top_k}, label={args.label})")
-    report = run(args.base_url, golden, args.top_k, args.label)
+    report = run(args.base_url, golden, args.top_k, args.label, args.delay)
     summary = report.summary()
 
     print("\nResults")

@@ -3,6 +3,8 @@
 
 import json
 
+import httpx
+import openai
 import pytest
 from fastapi.testclient import TestClient
 
@@ -58,6 +60,16 @@ def test_missing_api_key_returns_503(relevant, monkeypatch):
 
     monkeypatch.setattr(llm, "complete", not_configured)
     assert client.post("/ask", json={"question": "How much leave?"}).status_code == 503
+
+
+def test_llm_provider_error_returns_502(relevant, monkeypatch):
+    def provider_down(_):
+        raise openai.APIConnectionError(request=httpx.Request("POST", "https://llm.example/chat"))
+
+    monkeypatch.setattr(llm, "complete", provider_down)
+    resp = client.post("/ask", json={"question": "How much leave?"})
+    assert resp.status_code == 502
+    assert "LLM provider error" in resp.json()["detail"]
 
 
 def test_validation_rejects_empty_question():

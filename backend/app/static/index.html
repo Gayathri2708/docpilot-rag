@@ -61,7 +61,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
-const withCites = (s) => esc(s).replace(/\[(\d+)\]/g, '<span class="cite">$1</span>');
+const withCites = (s) => esc(s).replace(/[\[【](\d+)[\]】]/g, '<span class="cite">$1</span>');
 
 async function loadDocs() {
   const res = await fetch("/documents");

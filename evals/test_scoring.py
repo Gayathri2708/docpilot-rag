@@ -1,4 +1,8 @@
-from run_eval import HERE, evidence_rank, is_refusal, keywords_match, load_golden, percentile
+import httpx
+
+import run_eval
+from app.ingest import SUPPORTED_EXTENSIONS, chunk_pages, extract_pages
+from run_eval import HERE, ask_with_retry, evidence_rank, is_refusal, keywords_match, load_golden, normalize, percentile
 
 
 def test_keywords_require_every_group():
@@ -26,10 +30,29 @@ def test_percentile():
     assert percentile([], 95) == 0.0
 
 
-def test_golden_evidence_exists_in_sample_doc():
-    """Guards the golden set itself: every evidence string must really be in the document."""
-    doc = (HERE / "sample_docs" / "northwind_handbook.md").read_text(encoding="utf-8")
-    flat = " ".join(doc.split()).lower()
+def test_golden_evidence_exists_in_exactly_one_sample_doc():
+    """Guards the golden set itself: every evidence string must survive extraction and chunking
+    (so retrieval can find it) and appear in only one document (so a hit means the right source)."""
+    chunks_by_doc = {}
+    for path in sorted((HERE / "sample_docs").iterdir()):
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            pages = extract_pages(path.name, path.read_bytes())
+            chunks_by_doc[path.name] = [normalize(c.content) for c in chunk_pages(pages)]
+    assert len(chunks_by_doc) >= 5
+
     for case in load_golden(HERE / "golden.jsonl"):
         if case["answerable"]:
-            assert " ".join(case["evidence"].split()).lower() in flat, case["id"]
+            evidence = normalize(case["evidence"])
+            docs = [name for name, chunks in chunks_by_doc.items() if any(evidence in c for c in chunks)]
+            assert len(docs) == 1, (case["id"], docs)
+
+
+def test_ask_retries_rate_limits_with_backoff(monkeypatch):
+    statuses = iter([429, 502, 200])
+    waits = []
+    monkeypatch.setattr(run_eval.time, "sleep", waits.append)
+    transport = httpx.MockTransport(lambda request: httpx.Response(next(statuses), json={"answer": "ok"}))
+    with httpx.Client(transport=transport, base_url="http://test") as client:
+        body, _ = ask_with_retry(client, "q", 5)
+    assert body == {"answer": "ok"}
+    assert waits == [15, 30]

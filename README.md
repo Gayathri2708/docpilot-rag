@@ -4,7 +4,7 @@
 
 DocPilot is a retrieval-augmented generation (RAG) service built with FastAPI, PostgreSQL + pgvector and any OpenAI-compatible LLM. It ships with an evaluation harness so retrieval and answer quality are measured, not guessed.
 
-![CI](https://github.com/Gayathri2708/docpilot/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Gayathri2708/docpilot-rag/actions/workflows/ci.yml/badge.svg)
 
 ## Architecture
 
@@ -77,26 +77,38 @@ The first upload downloads the embedding model (~130 MB) once.
 
 ## Evaluation
 
-`evals/golden.jsonl` holds 20 questions about a sample handbook (`evals/sample_docs/`): 16 answerable, each with the exact evidence sentence and expected facts, and 4 that the document cannot answer, to test refusal.
+`evals/sample_docs/` holds five documents from one fictional company, Northwind Labs: an employee handbook, an engineering onboarding guide and a product FAQ (Markdown), and a travel & expense policy and an information security policy (PDF, 4 pages each). They deliberately overlap in topic but not in facts (paid leave vs. leave encashment, domestic vs. international hotel limits, internal P1 incidents vs. customer Priority 1 tickets), so retrieval has to pick the right document, not just the right topic.
+
+`evals/golden.jsonl` holds 60 questions: 48 answerable, each with the exact evidence sentence and expected facts, and 12 that no document answers, to test refusal. They mix exact-term questions (policy codes such as `FIN-F12`, product names, numbers), paraphrased questions, multi-fact questions and near-miss unanswerable ones. A test checks that every evidence string survives extraction and chunking and appears in exactly one document.
 
 ```bash
 # with the API running, from the repository root
-python evals/run_eval.py --upload evals/sample_docs/northwind_handbook.md --label baseline
+python evals/run_eval.py --upload evals/sample_docs/*.md evals/sample_docs/*.pdf --label baseline
+# on a rate-limited free LLM tier (e.g. 5 requests/minute), pace the run:
+python evals/run_eval.py --delay 13
 ```
 
 Each run prints a per-question PASS/FAIL list and saves a JSON report to `evals/results/`.
 
 ### Results
 
-| Run | hit@k | MRR | Answer acc. | Refusal acc. | False refusals | p95 latency |
-|---|---|---|---|---|---|---|
-| baseline (k=5) | _run it_ | | | | | |
+60 cases (48 answerable, 12 unanswerable), dense retrieval only, `top_k=5`, `MIN_RELEVANCE=0.55`, LLM `openai/gpt-oss-120b` on Groq, run on 13 Oct 2026.
+
+| Run | hit@k | MRR | Answer acc. | Refusal acc. | False refusals | Citation rate | p50 / p95 latency |
+|---|---|---|---|---|---|---|---|
+| baseline (k=5) | 1.00 | 0.886 | 1.00 (48/48) | 1.00 (12/12) | 0.00 | 1.00 | 7.7 s / 9.7 s |
+
+Notes:
+- **Retrieval is the weak spot, not generation.** Every evidence chunk is in the top 5, but MRR 0.886 means the right chunk is often ranked 2nd to 5th, mostly on exact-term and cross-document questions (`fin-encashment` at rank 4, `fin-advance` at rank 5). This is what hybrid search is meant to fix.
+- **Run-to-run variance:** an earlier run with the same settings scored 47/48 on answers. On `fin-intl-hotel` the model gave the USD 250 high-cost-city cap instead of the standard USD 180. Treat a single-question difference as noise.
+- **Model portability:** switching from Gemini to gpt-oss on Groq needed only `.env` changes, but it exposed one bug: gpt-oss cites as `【1】`, which the citation parser didn't recognise (citation rate showed 0.27). The parser and UI now accept both bracket styles, with a test.
+- Latency is dominated by the LLM call; the near-zero-latency case (7 ms) is a question refused by the relevance gate without calling the LLM.
 
 ### Experiments to run next
 
 1. **Relevance threshold:** sweep `MIN_RELEVANCE` (0.45 → 0.70) and pick the value that keeps refusal accuracy high without raising false refusals.
 2. **Chunk size:** compare `CHUNK_MAX_CHARS` 500 / 1000 / 1500 at `--top-k 3`.
-3. **Harder corpus:** index several long PDFs so retrieval actually has to discriminate, and extend the golden set.
+3. **Hybrid search:** add BM25 over the existing `tsvector` column and measure whether exact-term questions (policy codes, product names) move to rank 1.
 
 ## Design decisions
 

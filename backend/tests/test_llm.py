@@ -36,5 +36,9 @@ def test_cited_indices_dedupes_and_drops_out_of_range():
     assert cited_indices(answer, num_sources=3) == [1, 2]
 
 
+def test_cited_indices_accepts_full_width_brackets():
+    assert cited_indices("Hotel cap is USD 180 per night【2】.", num_sources=3) == [2]
+
+
 def test_no_citations():
     assert cited_indices(REFUSAL, num_sources=5) == []
