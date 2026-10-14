@@ -19,9 +19,12 @@ CREATE TABLE IF NOT EXISTS api_keys (
     id          BIGSERIAL PRIMARY KEY,
     name        TEXT        NOT NULL UNIQUE,
     key_hash    TEXT        NOT NULL UNIQUE,   -- SHA-256 of the key; the key itself is never stored
-    groups      TEXT[]      NOT NULL,          -- groups this key may read and write, besides 'all'
+    groups      TEXT[]      NOT NULL,          -- groups this key may read, besides 'all'
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Only admin keys may upload or delete documents. Existing keys become read-only.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS chunks (
     id           BIGSERIAL PRIMARY KEY,

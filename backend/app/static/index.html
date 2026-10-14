@@ -41,11 +41,11 @@
       <input id="key" type="password" placeholder="X-API-Key" autocomplete="off">
       <button id="saveKey" type="button">Use key</button>
     </div>
-    <div class="status hint" id="keyStatus">Demo keys: <code>dp_demo_admin</code>, <code>dp_demo_hr</code>, <code>dp_demo_finance</code>, <code>dp_demo_engineering</code>. Each key sees only its access groups.</div>
+    <div class="status hint" id="keyStatus">Demo keys: <code>dp_demo_admin</code> (can upload), <code>dp_demo_hr</code>, <code>dp_demo_finance</code>, <code>dp_demo_engineering</code> (read-only). Each key sees only its access groups.</div>
   </section>
 
   <section class="card">
-    <label for="file">Upload a document (PDF, TXT, MD)</label>
+    <label for="file">Upload a document (PDF, TXT, MD) · admin keys only</label>
     <div class="row">
       <input id="file" type="file" accept=".pdf,.txt,.md">
       <select id="group" aria-label="Access group">

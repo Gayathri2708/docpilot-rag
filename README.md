@@ -10,7 +10,7 @@ DocPilot is a general-purpose retrieval-augmented generation (RAG) service for a
 
 ```mermaid
 flowchart LR
-    U[Web UI / API client] -->|upload| I[Ingestion]
+    U[Web UI / API client] -->|upload, admin key| I[Ingestion]
     I --> X[Text extraction<br/>pypdf]
     X --> C[Sentence-aware chunking<br/>with overlap]
     C --> E[Local embeddings<br/>bge-small, fastembed]
@@ -39,7 +39,7 @@ flowchart LR
 - **Reranker (optional):** a local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-orders the top 20 candidates. `RERANK=true|false`, or per request.
 - **Grounded answers:** numbered sources in the prompt, mandatory `[n]` citations, exact refusal sentence when the answer isn't in the sources.
 - **Relevance gate:** if the best chunk scores below `MIN_RELEVANCE`, DocPilot refuses without calling the LLM. This cuts cost and removes a whole class of hallucinations.
-- **Access control (RBAC):** every document belongs to an access group (`all`, `hr`, `finance`, `engineering`); every API key maps to the groups it may read. Retrieval filters by group inside SQL, so restricted chunks never reach the reranker or the LLM. See [Security](#security).
+- **Access control (RBAC):** every document belongs to an access group (`all`, `hr`, `finance`, `engineering`); every API key maps to the groups it may read, and only admin keys may upload or delete. Retrieval filters by group inside SQL, so restricted chunks never reach the reranker or the LLM. See [Security](#security).
 - **Prompt-injection guard:** retrieved text is labelled untrusted data in the system prompt, and a dedicated injection test set measures whether answers obey planted instructions.
 - **Streaming:** Server-Sent Events (`sources` → `token`… → `done` / `error`).
 - **MCP server:** search and question your documents from Claude Desktop or any MCP client, through the same API keys and access groups. See [Use it from Claude Desktop (MCP)](#use-it-from-claude-desktop-mcp).
@@ -82,16 +82,16 @@ cp .env.example .env        # then add LLM_API_KEY (free Groq or Gemini keys wor
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000 for the UI, or http://localhost:8000/docs for the interactive API docs. Every endpoint except `/health` needs an API key: paste a demo key (below) into the UI, or click **Authorize** in `/docs`.
+Open http://localhost:8000 for the UI, or http://localhost:8000/docs for the interactive API docs. Every endpoint except `/health` needs an API key: paste a demo key (below) into the UI, or click **Authorize** in `/docs`. Use `dp_demo_admin` to upload documents; the other demo keys are read-only.
 The embedding model and the reranker (about 150 MB together) download once, on first use.
 
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/documents` | Upload and index a file (multipart `file`, optional `access_group`, default `all`) |
+| `POST` | `/documents` | **Admin keys only.** Upload and index a file (multipart `file`, optional `access_group`, default `all`) |
 | `GET` | `/documents` | List the documents this key can see |
-| `DELETE` | `/documents/{id}` | Remove a document and its chunks (only within the key's groups) |
+| `DELETE` | `/documents/{id}` | **Admin keys only.** Remove a document and its chunks (only within the key's groups) |
 | `POST` | `/search` | Retrieval only: `{"query", "top_k", "mode", "rerank"}` |
 | `POST` | `/ask` | Answer with sources and timings: `{"question", "top_k", "mode", "rerank"}` |
 | `POST` | `/ask/stream` | Same, streamed as Server-Sent Events |
@@ -145,18 +145,28 @@ The server runs over stdio. Tests in [`mcp_server/test_docpilot_mcp.py`](mcp_ser
 
 ### API keys and access groups
 
-- **Access groups.** Each document is uploaded into one group: `all` (everyone), `hr`, `finance` or `engineering`. Each API key lists the groups it may read and write; every key can also read `all`.
-- **Keys are hashed.** The `api_keys` table stores only the SHA-256 of each key, never the key itself. Create a key with `python -m app.auth create-key finance-bot --groups finance` (run from `backend/`); it is printed once.
-- **Demo keys.** On startup DocPilot seeds four well-known keys for local use: `dp_demo_admin` (all groups), `dp_demo_hr`, `dp_demo_finance` and `dp_demo_engineering`, and logs a warning. Set `SEED_DEMO_KEYS=false` anywhere real: startup then deletes any demo keys seeded earlier, so they stop working.
+- **Access groups.** Each document is uploaded into one group: `all` (everyone), `hr`, `finance` or `engineering`. Each API key lists the groups it may read; every key can also read `all`.
+- **Two roles: read-only and admin.** Every key can search and ask. Only admin keys can upload or delete documents, which also means only admins can write to the shared `all` group that every key reads. An admin can write only to `all` and to its own groups: an engineering admin can't upload into `hr` (`403`) or delete an HR document (`404`). Read-only keys get `403` before the upload is even read.
+- **Keys are hashed.** The `api_keys` table stores only the SHA-256 of each key, never the key itself. Create a key from `backend/`; it is printed once:
+
+  ```bash
+  python -m app.auth create-key finance-bot --groups finance          # read-only
+  python -m app.auth create-key hr-admin --groups hr --admin           # can upload/delete in hr and all
+  ```
+
+  Keys created before roles existed become read-only (`is_admin` defaults to false); recreate any key that needs to upload.
+- **Demo keys.** On startup DocPilot seeds four well-known keys for local use: `dp_demo_admin` (admin, all groups), and the read-only `dp_demo_hr`, `dp_demo_finance` and `dp_demo_engineering`. It logs a warning while they are enabled. Set `SEED_DEMO_KEYS=false` anywhere real: startup then deletes any demo keys seeded earlier, so they stop working.
 - **Filtering happens in SQL, before ranking.** Both retrievers have `WHERE d.access_group = ANY(%(groups)s)`, so restricted chunks are never scored, fused, reranked, returned by `/search` or put in an LLM prompt by `/ask` and `/ask/stream`. Filtering after retrieval would also hurt quality, because restricted chunks would use up the top-k slots.
 - **Filtered vector search still returns k results.** HNSW indexes apply `WHERE` clauses after the index scan, so a restrictive filter can silently return fewer than k chunks. Each connection sets `hnsw.iterative_scan = strict_order` (pgvector 0.8+) so the scan continues until enough rows pass the filter.
-- **No information leaks through side doors.** Listing and deleting are scoped to the key's groups. Deleting a document you can't see returns `404`, not `403`. Re-uploading a restricted file returns `409` without its name.
+- **No information leaks through side doors.** Listing and deleting are scoped to the key's groups. An admin deleting a document outside its groups gets `404`, not `403`. An admin re-uploading a file already indexed in a group it can't read gets `409` without the file's name.
 
-**Tested end to end.** [`test_rbac_integration.py`](backend/tests/test_rbac_integration.py) runs against real Postgres and real embeddings. It indexes an HR-only document containing a unique canary string, then shows that an engineering key cannot reach it through `/search` (vector and hybrid), `/ask`, `/ask/stream`, listing, deleting or re-uploading. A stubbed LLM records every prompt, so the test checks that the canary never appears in what would be sent to the model. Removing the SQL filter makes four of these tests fail. Another test checks that `SEED_DEMO_KEYS=false` revokes the demo keys.
+**Tested end to end.** [`test_rbac_integration.py`](backend/tests/test_rbac_integration.py) runs against real Postgres and real embeddings. It indexes an HR-only document containing a unique canary string, then shows that an engineering key cannot reach it through `/search` (vector and hybrid), `/ask`, `/ask/stream` or listing. A stubbed LLM records every prompt, so the test checks that the canary never appears in what would be sent to the model. Removing the SQL filter makes four of these tests fail.
+
+The same file tests the roles: read-only keys can't upload to any group (including `all`) or delete even documents they can read; an engineering-only admin can write to `all` and `engineering` but can't upload into or delete from `hr`; seeding upgrades a `dp_demo_admin` created before roles existed; and `SEED_DEMO_KEYS=false` revokes the demo keys. Letting any key upload and delete makes eight tests fail; the group check is a second layer, because it also requires admin.
 
 ### Prompt injection
 
-Uploaded documents are untrusted: anyone who can upload can plant instructions aimed at the model. Defences:
+Uploaded documents are untrusted. Uploads are limited to admin keys, but a document's original author (a vendor contract, a forwarded email, a wiki export) can still have planted instructions aimed at the model. Defences:
 
 - The system prompt marks sources as untrusted data and tells the model to ignore instructions inside them.
 - Sources are numbered and quoted as data in the user turn, separate from the system instructions.
@@ -171,7 +181,7 @@ python evals/run_eval.py --golden evals/injection.jsonl --upload evals/injection
 ### Known limitations
 
 - API keys are bearer secrets with no expiry or rotation endpoint yet, and there is no rate limiting or audit log.
-- Any key may upload to the shared `all` group, which every key can read. Anyone with a key can therefore add content (including injection attempts) that other users retrieve.
+- An admin key can still upload text containing prompt-injection attempts that every key then retrieves from `all`. Admin keys should be few, and the injection defences above still apply.
 - Access groups are a fixed list; per-tenant isolation with Postgres row-level security is on the roadmap.
 - The injection set covers common attack styles, not every possible one. A model that resists them can still be fooled by new phrasing.
 
@@ -202,7 +212,7 @@ python evals/run_eval.py --mode hybrid
 python evals/run_eval.py --mode hybrid+rerank --retrieval-only
 ```
 
-Each run prints a per-question result (PASS/FAIL, or the evidence rank with `--retrieval-only`) and saves a JSON report to `evals/results/`, which is git-ignored.
+The harness uses `--api-key` (default `dp_demo_admin`); `--upload` and `--cleanup` need an admin key. Each run prints a per-question result (PASS/FAIL, or the evidence rank with `--retrieval-only`) and saves a JSON report to `evals/results/`, which is git-ignored.
 
 ### Results
 

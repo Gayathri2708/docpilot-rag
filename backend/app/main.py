@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db, llm
-from .auth import ACCESS_GROUPS, Principal, require_principal, revoke_demo_keys, seed_demo_keys
+from .auth import ACCESS_GROUPS, Principal, require_admin, require_principal, revoke_demo_keys, seed_demo_keys
 from .config import settings
 from .embeddings import embed_passages
 from .ingest import UnreadableFile, UnsupportedFileType, chunk_pages, extract_pages, sha256
@@ -129,6 +129,7 @@ def _provider_error(exc: Exception) -> str:
 
 
 Caller = Depends(require_principal)
+Admin = Depends(require_admin)
 
 
 @app.post("/documents", response_model=DocumentOut, status_code=201)
@@ -136,11 +137,12 @@ def upload_document(
     file: UploadFile,
     response: Response,
     access_group: str = Form("all", description=f"one of {', '.join(ACCESS_GROUPS)}"),
-    principal: Principal = Caller,
+    principal: Principal = Admin,
 ) -> DocumentOut:
+    """Admin keys only. An admin may write to "all" and to its own groups."""
     if access_group not in ACCESS_GROUPS:
         raise HTTPException(422, f"access_group must be one of {', '.join(ACCESS_GROUPS)}.")
-    if not principal.can_access(access_group):
+    if not principal.can_write(access_group):
         raise HTTPException(403, f"This API key cannot write to the {access_group!r} group.")
     filename = file.filename or "upload"
     data = file.file.read(settings.max_upload_mb * 1024 * 1024 + 1)
@@ -212,7 +214,8 @@ def list_documents(principal: Principal = Caller) -> list[DocumentOut]:
 
 
 @app.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: str, principal: Principal = Caller) -> Response:
+def delete_document(document_id: str, principal: Principal = Admin) -> Response:
+    """Admin keys only, and only within the admin's groups."""
     with db.get_conn() as conn:
         # Documents outside the caller's groups are reported as not found, not as forbidden.
         deleted = conn.execute(

@@ -15,8 +15,9 @@ from app.retrieval import Hit
 
 client = TestClient(main.app)
 
-ADMIN = Principal("test-admin", ("all", "hr", "finance", "engineering"))
-ENGINEER = Principal("test-engineering", ("all", "engineering"))
+ADMIN = Principal("test-admin", ("all", "hr", "finance", "engineering"), is_admin=True)
+ENGINEER = Principal("test-engineering", ("all", "engineering"))  # read-only
+ENGINEERING_ADMIN = Principal("test-eng-admin", ("all", "engineering"), is_admin=True)
 
 
 @pytest.fixture(autouse=True)
@@ -255,9 +256,33 @@ def test_ask_endpoints_retrieve_with_caller_groups(caller, monkeypatch, path, bo
     assert seen["groups"] == ("all", "engineering")
 
 
-def test_upload_into_a_group_the_key_lacks_is_forbidden(caller):
-    caller(ENGINEER)
+def test_admin_cannot_upload_into_a_group_it_lacks(caller):
+    caller(ENGINEERING_ADMIN)
     resp = client.post("/documents", files={"file": ("pay.md", b"salary bands")}, data={"access_group": "hr"})
+    assert resp.status_code == 403
+    assert "'hr' group" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("group", ["all", "engineering"])
+def test_read_only_key_cannot_upload_even_to_its_own_or_shared_group(caller, group):
+    caller(ENGINEER)
+    resp = client.post("/documents", files={"file": ("note.md", b"planted text")}, data={"access_group": group})
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
+
+
+def test_read_only_key_cannot_delete(caller, monkeypatch):
+    def must_not_touch_db():
+        raise AssertionError("a read-only key must be rejected before the database is used")
+
+    caller(ENGINEER)
+    monkeypatch.setattr(main.db, "get_conn", must_not_touch_db)
+    resp = client.delete("/documents/any-id")
+    assert resp.status_code == 403
+
+
+def test_read_only_key_is_rejected_by_real_dependency(real_auth):
+    resp = client.post("/documents", headers={"X-API-Key": "good-key"}, files={"file": ("a.md", b"text")})
     assert resp.status_code == 403
 
 
