@@ -282,7 +282,7 @@ def main() -> None:
     parser.add_argument("--retrieval-only", action="store_true", help="measure retrieval only; no LLM calls")
     parser.add_argument("--label", help="name for this run, e.g. 'k=3'; defaults to the mode")
     parser.add_argument("--api-key", default=os.getenv("DOCPILOT_API_KEY", "dp_demo_admin"),
-                        help="key that can read every group in the golden set; --upload and --cleanup need an admin key")
+                        help="key that can read every group in the golden set; --upload/--cleanup need an admin key")
     parser.add_argument("--cleanup", action="store_true", help="delete the documents this run uploaded")
     parser.add_argument("--strict", action="store_true", help="exit 1 if any case fails")
     parser.add_argument("--baseline", type=Path,
