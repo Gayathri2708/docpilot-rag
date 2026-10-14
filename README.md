@@ -187,12 +187,50 @@ python evals/run_eval.py --golden evals/injection.jsonl --upload evals/injection
 
 ## CI
 
-[GitHub Actions](.github/workflows/ci.yml) runs two jobs on every push and pull request:
+[GitHub Actions](.github/workflows/ci.yml) runs these jobs on every push and pull request:
 
 1. **Lint and unit tests:** `ruff check` and `pytest`, without a database or LLM.
 2. **Access-control tests and retrieval eval gate:** starts Postgres + pgvector as a service, runs the RBAC integration tests, starts the API, indexes the sample documents and runs the retrieval-only eval for `vector`, `hybrid` and `hybrid+rerank`. The build **fails if hit@5 or MRR drops below [`evals/baseline.json`](evals/baseline.json)** for any mode. Retrieval-only means no LLM key or quota is needed, and the run is deterministic. If a repository secret `LLM_API_KEY` (Groq) is set, the job also runs the prompt-injection eval and fails if any answer obeys a planted instruction.
 
+3. **Docker image with public-demo settings:** builds the [`Dockerfile`](Dockerfile), checks that no `.env` file is inside the image, starts it against Postgres and runs [`deploy/smoke_test.sh`](deploy/smoke_test.sh): sample documents preloaded, visitor key read-only, uploads off, well-known demo keys revoked, rate limit returning `429`.
+4. **Deploy** (pushes to `main` only, after the three jobs above pass): publishes the app to the Hugging Face Space. See [Deployment](#deployment).
+
 When a change improves retrieval, update `evals/baseline.json` in the same pull request, so the new level becomes the floor.
+
+## Deployment
+
+The public demo runs on free tiers: the app on a **Hugging Face Space** (Docker) and Postgres + pgvector on **Neon**.
+
+| Host considered | Free tier | Verdict |
+|---|---|---|
+| Hugging Face Spaces (Docker) | 2 vCPU, 16 GB RAM; sleeps after 48 h without visits | **Chosen.** Ample memory for the embedding model and reranker. |
+| Render | 512 MB RAM, 0.1 CPU; sleeps after 15 min idle, ~1 min to wake | Too little memory for the models; frequent cold starts. |
+| Railway | One-time trial credit, then 0.5 GB RAM | Not free long-term; same memory problem. |
+
+Neon over Supabase: both offer pgvector for free, but Neon scales to zero and wakes automatically on the next query, while a free Supabase project pauses after a week idle and needs a manual restore.
+
+### Public demo safety
+
+The [`Dockerfile`](Dockerfile) bakes in safe defaults, so the host only needs two secrets:
+
+| Setting | Demo value | Effect |
+|---|---|---|
+| `SEED_DEMO_KEYS` | `false` | The well-known `dp_demo_*` keys (including the admin) don't exist, and are revoked if they did |
+| `PUBLIC_DEMO_KEY` | `dp_public_demo` | Read-only visitor key that sees only the `all` group; the UI fills it in automatically |
+| `UPLOADS_ENABLED` | `false` | Every upload is rejected (`403`), whatever the key |
+| `PRELOAD_DIR` | the sample documents | Indexed into `all` on startup; files already indexed are skipped |
+| `RATE_LIMIT_PER_MINUTE` | `6` | Per visitor, across `/search`, `/ask` and `/ask/stream` (`429` with `Retry-After`) |
+| `ASK_DAILY_LIMIT` | `100` | Global cap on questions per UTC day, so the LLM bill can't run away |
+| `TRUST_PROXY_HEADERS` | `true` | Identify visitors by `X-Forwarded-For`, which the Space's proxy sets |
+| `LLM_MODEL` | `openai/gpt-oss-20b` (Groq) | A separate quota from the `gpt-oss-120b` used for evals |
+
+`DATABASE_URL` and `LLM_API_KEY` are set as **secrets in the host's settings**. They are never in the repository or the image: `.env` is git-ignored and excluded by `.dockerignore`, and CI checks the image for it. The per-visitor limit is best effort, because `X-Forwarded-For` can be spoofed; the daily cap is the hard limit. Limits are kept in memory, so the container runs a single worker.
+
+### How deploys happen
+
+The `deploy` job in CI copies only what the image needs (Dockerfile, `backend/app`, requirements, sample documents and a Space README with the required [`sdk: docker` metadata](deploy/huggingface/README.md)) and force-pushes it to the Space, which rebuilds. It runs only after lint, tests, the eval gate and the Docker smoke test pass, so a failing build never reaches the demo. A [daily workflow](.github/workflows/keepalive.yml) requests `/health` so the free Space doesn't fall asleep between recruiter visits.
+
+To deploy your own copy: create a Neon project (pgvector is enabled automatically by the app) and a Docker Space, add `DATABASE_URL` and `LLM_API_KEY` as Space secrets, then add an `HF_TOKEN` secret (a write token) and an `HF_SPACE` variable (`user/space`) to the GitHub repository. Use Neon's **direct** connection string, not the pooled one: DocPilot sets a per-session pgvector option that a transaction pooler would drop.
 
 ## Evaluation
 
@@ -282,7 +320,9 @@ backend/tests/      unit and API tests (no DB or LLM needed); RBAC integration t
 evals/              golden set, sample documents, eval harness, baseline and its tests
 evals/injection*    prompt-injection documents and questions
 mcp_server/         MCP server (search / ask / list tools) and its tests
-docker-compose.yml  Postgres 16 + pgvector
+deploy/             Hugging Face Space README and the public-demo smoke test
+Dockerfile          public read-only demo image (Hugging Face Spaces, or any Docker host)
+docker-compose.yml  Postgres 16 + pgvector for local development
 ```
 
 Note: the embedding dimension (384) is fixed in `schema.sql`. Changing `EMBEDDING_MODEL` to a model with a different dimension needs a matching schema change and a re-index.

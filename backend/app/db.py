@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,19 +10,29 @@ from psycopg_pool import ConnectionPool
 from .config import settings
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+log = logging.getLogger("docpilot")
 
 
 def _configure(conn: psycopg.Connection) -> None:
     register_vector(conn)
     # Retrieval filters by access group. Plain HNSW search filters *after* the index scan, so a
     # restrictive filter can return fewer than k rows; iterative scans keep going until enough
-    # rows pass the filter, in exact distance order. Requires pgvector >= 0.8.
-    conn.execute("SET hnsw.iterative_scan = strict_order")
+    # rows pass the filter, in exact distance order. Needs pgvector >= 0.8; older versions still
+    # work, with that caveat, rather than failing every connection.
+    try:
+        conn.execute("SET hnsw.iterative_scan = strict_order")
+    except psycopg.Error:
+        conn.rollback()
+        log.warning("pgvector < 0.8: hnsw.iterative_scan unavailable; filtered searches may return fewer rows")
     conn.commit()
 
 
 def make_pool(database_url: str) -> ConnectionPool:
-    return ConnectionPool(database_url, min_size=1, max_size=10, configure=_configure, open=False)
+    # check: test each connection before handing it out. Serverless Postgres (e.g. Neon) closes idle
+    # connections when it scales to zero; without this the first request after a pause would fail.
+    return ConnectionPool(
+        database_url, min_size=1, max_size=10, configure=_configure, check=ConnectionPool.check_connection, open=False
+    )
 
 
 pool = make_pool(settings.database_url)

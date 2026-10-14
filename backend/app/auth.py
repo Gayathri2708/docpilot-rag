@@ -83,6 +83,12 @@ def seed_demo_keys() -> None:
             _insert(conn, name, key, groups, is_admin, replace=True)
 
 
+def seed_public_key(key: str) -> None:
+    """The visitor key of a public deployment: read-only, and it sees only the shared "all" group."""
+    with get_conn() as conn:
+        _insert(conn, "public-demo", key, [], is_admin=False, replace=True)
+
+
 def revoke_demo_keys() -> int:
     """Delete the well-known demo keys, so turning SEED_DEMO_KEYS off also disables ones seeded earlier."""
     with get_conn() as conn:

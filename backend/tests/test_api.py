@@ -21,6 +21,13 @@ ENGINEERING_ADMIN = Principal("test-eng-admin", ("all", "engineering"), is_admin
 
 
 @pytest.fixture(autouse=True)
+def fresh_limits():
+    main.limiter.reset()
+    yield
+    main.limiter.reset()
+
+
+@pytest.fixture(autouse=True)
 def caller():
     """Every request is made as ADMIN unless a test switches the caller."""
     def use(principal):
@@ -289,3 +296,58 @@ def test_read_only_key_is_rejected_by_real_dependency(real_auth):
 def test_upload_rejects_unknown_group():
     resp = client.post("/documents", files={"file": ("a.md", b"text")}, data={"access_group": "legal"})
     assert resp.status_code == 422
+
+
+# ---------- public deployment ----------
+
+def test_per_client_rate_limit_returns_429_with_retry_after(relevant, monkeypatch):
+    monkeypatch.setattr(main.settings, "rate_limit_per_minute", 2)
+    monkeypatch.setattr(llm, "complete", lambda messages: "24 days [1].")
+    codes = [client.post("/ask", json={"question": "Leave?"}).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+    resp = client.post("/search", json={"query": "Leave?"})  # same client, same window
+    assert resp.status_code == 429
+    assert int(resp.headers["Retry-After"]) >= 1
+
+
+def test_daily_cap_protects_the_llm_budget_across_clients(relevant, monkeypatch):
+    monkeypatch.setattr(main.settings, "ask_daily_limit", 2)
+    monkeypatch.setattr(main.settings, "trust_proxy_headers", True)
+    monkeypatch.setattr(llm, "stream", lambda messages: iter(["24 days [1]."]))
+    monkeypatch.setattr(llm, "complete", lambda messages: "24 days [1].")
+    ips = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+    codes = [
+        client.post(path, json={"question": "Leave?"}, headers={"X-Forwarded-For": ip}).status_code
+        for path, ip in zip(["/ask", "/ask/stream", "/ask"], ips, strict=True)
+    ]
+    assert codes == [200, 200, 429]
+    assert "daily question limit" in client.post("/ask", json={"question": "q"}).json()["detail"]
+
+
+def test_forwarded_for_is_ignored_unless_trusted(relevant, monkeypatch):
+    monkeypatch.setattr(main.settings, "rate_limit_per_minute", 1)
+    monkeypatch.setattr(main.settings, "trust_proxy_headers", False)
+    first = client.post("/search", json={"query": "q"}, headers={"X-Forwarded-For": "1.1.1.1"})
+    spoofed = client.post("/search", json={"query": "q"}, headers={"X-Forwarded-For": "9.9.9.9"})
+    assert (first.status_code, spoofed.status_code) == (200, 429)
+
+
+def test_trusted_forwarded_for_separates_clients(relevant, monkeypatch):
+    monkeypatch.setattr(main.settings, "rate_limit_per_minute", 1)
+    monkeypatch.setattr(main.settings, "trust_proxy_headers", True)
+    a = client.post("/search", json={"query": "q"}, headers={"X-Forwarded-For": "1.1.1.1, 10.0.0.1"})
+    b = client.post("/search", json={"query": "q"}, headers={"X-Forwarded-For": "2.2.2.2, 10.0.0.1"})
+    assert (a.status_code, b.status_code) == (200, 200)
+
+
+def test_uploads_can_be_disabled_even_for_admins(monkeypatch):
+    monkeypatch.setattr(main.settings, "uploads_enabled", False)
+    resp = client.post("/documents", files={"file": ("a.md", b"text")})
+    assert resp.status_code == 403
+    assert "disabled" in resp.json()["detail"]
+
+
+def test_public_config_needs_no_key(real_auth, monkeypatch):
+    monkeypatch.setattr(main.settings, "public_demo_key", "dp_public_demo")
+    monkeypatch.setattr(main.settings, "uploads_enabled", False)
+    assert client.get("/config").json() == {"public_demo_key": "dp_public_demo", "uploads_enabled": False}

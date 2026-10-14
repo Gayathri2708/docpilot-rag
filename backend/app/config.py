@@ -39,5 +39,19 @@ class Settings(BaseSettings):
     # Seed the well-known demo API keys (app/auth.py) on startup. Set to false anywhere real.
     seed_demo_keys: bool = True
 
+    # ---- Public deployment (see Dockerfile, which sets safe values) ----
+    # A read-only key for visitors, seeded on startup and shown in the UI. Empty = none.
+    public_demo_key: str = ""
+    # Index every file in this directory into the "all" group on startup (skips ones already indexed).
+    preload_dir: str = ""
+    # False rejects every upload, whatever the key.
+    uploads_enabled: bool = True
+    # Per-client requests per minute on /search, /ask and /ask/stream. 0 = unlimited.
+    rate_limit_per_minute: int = 0
+    # Global cap on /ask + /ask/stream requests per UTC day, to protect the LLM budget. 0 = unlimited.
+    ask_daily_limit: int = 0
+    # Identify clients by X-Forwarded-For (only behind a proxy that sets it, e.g. Hugging Face Spaces).
+    trust_proxy_headers: bool = False
+
 
 settings = Settings()

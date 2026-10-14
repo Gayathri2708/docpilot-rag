@@ -26,6 +26,9 @@
   .src.cited { border-left:3px solid var(--accent); padding-left:10px; }
   .meta { color:var(--muted); font-size:12px; margin-bottom:4px; }
   .status { color:var(--muted); font-size:13px; margin-top:8px; }
+  .banner { border-color:var(--accent); }
+  .examples { margin-top:10px; }
+  button.example { background:var(--accent-soft); color:var(--accent); font-weight:500; font-size:14px; padding:6px 10px; }
   .group { display:inline-block; border:1px solid var(--line); border-radius:6px; padding:0 6px; font-size:12px; color:var(--muted); }
   .hint code { font-size:12px; }
 </style>
@@ -34,6 +37,15 @@
 <main>
   <h1>DocPilot</h1>
   <p class="sub">Ask questions about your documents. Every answer cites its sources.</p>
+  <div class="card banner" id="demoBanner" hidden>
+    <strong>Public demo.</strong> You're using a read-only key over five sample documents from <em>Northwind Labs</em>, a fictional company (HR handbook, travel &amp; expense policy, security policy, onboarding guide, product FAQ). Try:
+    <div class="row examples">
+      <button type="button" class="example">How many days of paid leave do employees get?</button>
+      <button type="button" class="example">What is the hotel limit for international travel?</button>
+      <button type="button" class="example">Who is the CEO of Northwind?</button>
+    </div>
+    <div class="status">The last one isn't in the documents, so DocPilot refuses instead of guessing. Questions are rate-limited.</div>
+  </div>
 
   <section class="card">
     <label for="key">API key</label>
@@ -44,7 +56,7 @@
     <div class="status hint" id="keyStatus">Demo keys: <code>dp_demo_admin</code> (can upload), <code>dp_demo_hr</code>, <code>dp_demo_finance</code>, <code>dp_demo_engineering</code> (read-only). Each key sees only its access groups.</div>
   </section>
 
-  <section class="card">
+  <section class="card" id="uploadCard">
     <label for="file">Upload a document (PDF, TXT, MD) · admin keys only</label>
     <div class="row">
       <input id="file" type="file" accept=".pdf,.txt,.md">
@@ -181,7 +193,24 @@ $("askForm").onsubmit = async (e) => {
   }
 };
 
-loadDocs();
+// Public deployments expose a read-only visitor key and may disable uploads.
+async function applyPublicConfig() {
+  try {
+    const cfg = await (await fetch("/config")).json();
+    if (cfg.public_demo_key && !apiKey) {
+      apiKey = cfg.public_demo_key;
+      $("key").value = apiKey;
+    }
+    if (cfg.public_demo_key) $("demoBanner").hidden = false;
+    if (!cfg.uploads_enabled) $("uploadCard").hidden = true;
+  } catch {}
+}
+
+document.querySelectorAll(".example").forEach((b) => {
+  b.onclick = () => { $("q").value = b.textContent; $("askForm").requestSubmit(); };
+});
+
+applyPublicConfig().then(loadDocs);
 </script>
 </body>
 </html>

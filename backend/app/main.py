@@ -3,20 +3,20 @@ import logging
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 import openai
-import psycopg
-from fastapi import Depends, FastAPI, Form, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import db, llm
-from .auth import ACCESS_GROUPS, Principal, require_admin, require_principal, revoke_demo_keys, seed_demo_keys
+from . import auth, db, documents, llm
+from .auth import ACCESS_GROUPS, Principal, require_admin, require_principal
 from .config import settings
-from .embeddings import embed_passages
-from .ingest import UnreadableFile, UnsupportedFileType, chunk_pages, extract_pages, sha256
+from .ingest import UnreadableFile, UnsupportedFileType
+from .ratelimit import RateLimiter
 from .retrieval import Hit, Mode, search
 
 log = logging.getLogger("docpilot")
@@ -28,10 +28,14 @@ async def lifespan(_: FastAPI):
     db.apply_schema()
     db.open_pool()
     if settings.seed_demo_keys:
-        seed_demo_keys()
+        auth.seed_demo_keys()
         log.warning("Demo API keys are enabled (dp_demo_*). Set SEED_DEMO_KEYS=false for any real deployment.")
-    elif revoked := revoke_demo_keys():
+    elif revoked := auth.revoke_demo_keys():
         log.info("SEED_DEMO_KEYS=false: revoked %d demo API key(s)", revoked)
+    if settings.public_demo_key:
+        auth.seed_public_key(settings.public_demo_key)
+    if settings.preload_dir:
+        documents.preload(settings.preload_dir)
     yield
     db.close_pool()
 
@@ -131,6 +135,42 @@ def _provider_error(exc: Exception) -> str:
 Caller = Depends(require_principal)
 Admin = Depends(require_admin)
 
+limiter = RateLimiter()
+
+
+def _client_id(request: Request) -> str:
+    if settings.trust_proxy_headers and (forwarded := request.headers.get("x-forwarded-for")):
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _per_client_limit(request: Request) -> None:
+    if (retry := limiter.check_client(_client_id(request), settings.rate_limit_per_minute)) is not None:
+        raise HTTPException(
+            429, "Too many requests. Please wait a moment and try again.",
+            headers={"Retry-After": str(max(1, round(retry)))},
+        )
+
+
+def _llm_limits(request: Request) -> None:
+    _per_client_limit(request)
+    if not limiter.check_daily(settings.ask_daily_limit):
+        raise HTTPException(
+            429, "This demo has reached its daily question limit. Please try again tomorrow (UTC).",
+            headers={"Retry-After": "3600"},
+        )
+
+
+QueryLimit = Depends(_per_client_limit)
+AskLimit = Depends(_llm_limits)
+
+
+@app.get("/config")
+def public_config() -> dict:
+    """Public settings the web UI needs before a key is entered."""
+    return {"public_demo_key": settings.public_demo_key or None, "uploads_enabled": settings.uploads_enabled}
+
+
 
 @app.post("/documents", response_model=DocumentOut, status_code=201)
 def upload_document(
@@ -140,6 +180,8 @@ def upload_document(
     principal: Principal = Admin,
 ) -> DocumentOut:
     """Admin keys only. An admin may write to "all" and to its own groups."""
+    if not settings.uploads_enabled:
+        raise HTTPException(403, "Uploads are disabled on this deployment.")
     if access_group not in ACCESS_GROUPS:
         raise HTTPException(422, f"access_group must be one of {', '.join(ACCESS_GROUPS)}.")
     if not principal.can_write(access_group):
@@ -151,55 +193,20 @@ def upload_document(
     if not data:
         raise HTTPException(422, "File is empty.")
 
-    digest = sha256(data)
-    with db.get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id, filename, num_chunks, access_group FROM documents WHERE sha256 = %s", (digest,)
-        ).fetchone()
-    if existing:
-        if not principal.can_access(existing[3]):  # don't reveal a document the caller can't read
-            raise HTTPException(409, "This file is already indexed in an access group this key cannot read.")
-        response.status_code = 200
-        return DocumentOut(
-            id=str(existing[0]), filename=existing[1], num_chunks=existing[2], access_group=existing[3], duplicate=True
-        )
-
-    start = time.perf_counter()
     try:
-        pages = extract_pages(filename, data)
+        doc = documents.index_document(filename, data, access_group)
     except UnsupportedFileType as exc:
         raise HTTPException(415, str(exc)) from exc
-    except UnreadableFile as exc:
+    except (UnreadableFile, documents.NoText) as exc:
         raise HTTPException(422, str(exc)) from exc
-    chunks = chunk_pages(pages, settings.chunk_max_chars, settings.chunk_overlap_chars)
-    if not chunks:
-        raise HTTPException(422, "No extractable text found. Scanned PDFs need OCR, which is not supported yet.")
+    except documents.ConcurrentDuplicate as exc:
+        raise HTTPException(409, str(exc)) from exc
 
-    # Contextual header: prefix each chunk with its filename before embedding,
-    # so chunks like "It is 24 days per year" still carry document context.
-    vectors = embed_passages([f"{filename}\n{c.content}" for c in chunks])
-
-    try:
-        with db.get_conn() as conn, conn.transaction():
-            doc_id = conn.execute(
-                "INSERT INTO documents (filename, sha256, num_chunks, access_group) VALUES (%s, %s, %s, %s)"
-                " RETURNING id",
-                (filename, digest, len(chunks), access_group),
-            ).fetchone()[0]
-            with conn.cursor() as cur:
-                cur.executemany(
-                    "INSERT INTO chunks (document_id, chunk_index, page, content, embedding)"
-                    " VALUES (%s, %s, %s, %s, %s)",
-                    [(doc_id, c.index, c.page, c.content, v) for c, v in zip(chunks, vectors, strict=True)],
-                )
-    except psycopg.errors.UniqueViolation as exc:
-        # The same file was indexed by a concurrent request after our duplicate check.
-        raise HTTPException(409, "This file was just indexed by another request. Retry to see it.") from exc
-
-    log.info(
-        "ingested %s into %s: %d pages, %d chunks in %d ms", filename, access_group, len(pages), len(chunks), _ms(start)
-    )
-    return DocumentOut(id=str(doc_id), filename=filename, num_chunks=len(chunks), access_group=access_group)
+    if doc.duplicate:
+        if not principal.can_access(doc.access_group):  # don't reveal a document the caller can't read
+            raise HTTPException(409, "This file is already indexed in an access group this key cannot read.")
+        response.status_code = 200
+    return DocumentOut(**asdict(doc))
 
 
 @app.get("/documents", response_model=list[DocumentOut])
@@ -227,13 +234,13 @@ def delete_document(document_id: str, principal: Principal = Admin) -> Response:
     return Response(status_code=204)
 
 
-@app.post("/search")
+@app.post("/search", dependencies=[QueryLimit])
 def search_chunks(req: SearchRequest, principal: Principal = Caller) -> list[dict]:
     """Retrieval only, no LLM. Used by the eval harness to measure retrieval quality."""
     return [h.to_dict() for h in search(req.query, req.top_k, principal.groups, req.mode, req.rerank)]
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask", response_model=AskResponse, dependencies=[AskLimit])
 def ask(req: AskRequest, principal: Principal = Caller) -> AskResponse:
     t0 = time.perf_counter()
     hits = search(req.question, req.top_k, principal.groups, req.mode, req.rerank)
@@ -263,7 +270,7 @@ def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
-@app.post("/ask/stream")
+@app.post("/ask/stream", dependencies=[AskLimit])
 def ask_stream(req: AskRequest, principal: Principal = Caller) -> StreamingResponse:
     """Server-Sent Events: `sources` first, then `token` events, then `done` (or `error`)."""
 

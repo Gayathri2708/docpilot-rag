@@ -86,3 +86,67 @@ jobs:
       - name: API log
         if: failure()
         run: cat api.log
+
+  docker:
+    name: Docker image with public-demo settings
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: docpilot
+          POSTGRES_PASSWORD: docpilot
+          POSTGRES_DB: docpilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docpilot"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -t docpilot .
+      - name: The image contains no .env file
+        run: docker run --rm docpilot sh -c 'test -z "$(find /home/user -name .env)"'
+      - name: Start against Postgres
+        run: |
+          docker run -d --name app --network host \
+            -e DATABASE_URL=postgresql://docpilot:docpilot@localhost:5432/docpilot docpilot
+          timeout 180 bash -c 'until curl -sf localhost:7860/health; do sleep 2; done' || { docker logs app; exit 1; }
+      - name: Smoke-test public demo safety
+        run: deploy/smoke_test.sh http://localhost:7860
+      - name: Container log
+        if: always()
+        run: docker logs app 2>&1 | tail -50
+
+  deploy:
+    name: Deploy to Hugging Face Space
+    # Only after every check passes, only from main, and only once the HF_SPACE variable is set.
+    needs: [test, eval-gate, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.HF_SPACE != ''
+    runs-on: ubuntu-latest
+    concurrency: deploy
+    steps:
+      - uses: actions/checkout@v7
+      - name: Push the app to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          set -euo pipefail
+          test -n "$HF_TOKEN" || { echo "Add the HF_TOKEN repository secret first."; exit 1; }
+          space=$(mktemp -d)
+          mkdir -p "$space/backend" "$space/evals"
+          cp deploy/huggingface/README.md Dockerfile .dockerignore "$space/"
+          cp -r backend/app backend/requirements.txt "$space/backend/"
+          cp -r evals/sample_docs "$space/evals/"
+          find "$space" -name __pycache__ -prune -exec rm -rf {} +
+          cd "$space"
+          git init -q -b main
+          git lfs install --local
+          git lfs track "*.pdf"
+          git add -A
+          git -c user.name="github-actions" -c user.email="github-actions@users.noreply.github.com" \
+            commit -qm "Deploy ${GITHUB_SHA::7} from GitHub"
+          git push --force "https://${HF_SPACE%%/*}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" main
+          echo "Deployed ${GITHUB_SHA::7} to https://huggingface.co/spaces/${HF_SPACE}"
+

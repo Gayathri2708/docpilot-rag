@@ -189,3 +189,37 @@ def test_disabling_demo_keys_revokes_seeded_ones(client):
     finally:
         seed_demo_keys()  # restore for any later tests
     assert client.get("/documents", headers=ADMIN).status_code == 200
+
+
+# ---------- public deployment ----------
+
+def test_preload_indexes_into_all_and_is_idempotent(client, tmp_path):
+    from app import documents
+
+    (tmp_path / "welcome.md").write_text("# Welcome\n\nThe visitor guide says the demo office opens at 9:00.")
+    (tmp_path / "broken.pdf").write_bytes(b"%PDF-1.4 not a pdf")  # logged and skipped
+    (tmp_path / "notes.docx").write_bytes(b"unsupported")  # ignored
+
+    first = documents.preload(tmp_path)
+    assert [(d.filename, d.access_group, d.duplicate) for d in first] == [("welcome.md", "all", False)]
+    second = documents.preload(tmp_path)
+    assert [(d.id, d.duplicate) for d in second] == [(first[0].id, True)]
+
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM documents WHERE id = %s", (first[0].id,))
+
+
+def test_public_demo_key_is_read_only_and_sees_only_shared_documents(client):
+    from app import auth
+
+    auth.seed_public_key("dp_public_test")
+    public = {"X-API-Key": "dp_public_test"}
+    try:
+        assert client.get("/documents", headers=public).json() == []  # fixture docs are hr / engineering
+        hits = client.post("/search", headers=public, json={"query": HR_QUESTION, "top_k": 20}).json()
+        assert hits == []
+        upload = client.post("/documents", headers=public, files={"file": ("x.md", b"Planted text.")})
+        assert upload.status_code == 403
+    finally:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM api_keys WHERE name = 'public-demo'")
